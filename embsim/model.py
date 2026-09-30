@@ -78,6 +78,7 @@ class InterruptSource:
     service: int          # ISR 主体耗时（拍）
     entry: int = 0        # 进入开销（保存现场等）
     exit: int = 0         # 退出开销（恢复现场等）
+    priority: int = 0     # ISR 自身优先级；高优先级可嵌套抢占低优先级 ISR
 
     @property
     def total_cost(self) -> int:
@@ -106,3 +107,20 @@ class Resource:
     """互斥资源。持有者/等待队列在 System 运行态中维护。"""
 
     name: str
+
+
+# ---------------------------------------------------------------- 工作模式
+
+@dataclass
+class ModeSpec:
+    """运行期工作模式。
+
+    periods/deadlines 只影响切换后新释放的作业；已经释放的作业继续使用
+    释放时承诺的周期和截止时间。lock_budgets 按资源名限制持锁时长，
+    未列出的资源表示不限。
+    """
+
+    name: str
+    periods: Dict[str, int] = field(default_factory=dict)
+    deadlines: Dict[str, int] = field(default_factory=dict)
+    lock_budgets: Dict[str, int] = field(default_factory=dict)

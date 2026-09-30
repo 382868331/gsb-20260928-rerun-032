@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from embsim import (
     Costs,
     InterruptSource,
+    ModeSpec,
     System,
     TaskSpec,
     explain_miss,
@@ -388,6 +389,188 @@ class TestSnapshotResume(unittest.TestCase):
         whole = self.scenario()
         whole.run_until(30)
         self.assertEqual(segs(whole), segs(loaded))
+
+
+class TestRuntimeModeSwitch(unittest.TestCase):
+    def build(self):
+        return System(
+            tasks=[TaskSpec("T", 1, [run(4)], period=10)],
+            costs=Costs(context_switch=0),
+            modes=[
+                ModeSpec("A", periods={"T": 10}, deadlines={"T": 10}),
+                ModeSpec("B", periods={"T": 3}, deadlines={"T": 3}),
+            ],
+            initial_mode="A",
+        )
+
+    def test_immediate_switch_keeps_existing_job_promise(self):
+        sys_ = self.build()
+        sys_.run_until(2)
+        sys_.switch_mode("B", "immediate")
+        sys_.run_until(11)
+
+        first, second = sys_.jobs
+        self.assertEqual((first.mode, first.period, first.rel_deadline),
+                         ("A", 10, 10))
+        self.assertEqual(first.abs_deadline, 10)
+        self.assertEqual(first.pc, 1)  # 已执行进度未重置
+        self.assertEqual((second.release, second.mode, second.abs_deadline),
+                         (10, "B", 13))
+        self.assertEqual([(e.time, e.mode, e.strategy)
+                          for e in sys_.mode_events],
+                         [(0, "A", "initial"), (2, "B", "immediate")])
+        task_segments = [
+            s for s in sys_.trace if s.kind == "task" and s.jid == first.jid
+        ]
+        self.assertEqual(
+            [(s.start, s.end, s.mode) for s in task_segments],
+            [(0, 2, "A"), (2, 4, "B")],
+        )
+
+    def test_after_job_switch_waits_for_requested_job(self):
+        immediate = self.build()
+        immediate.run_until(2)
+        immediate.switch_mode("B", "immediate")
+        immediate.run_until(5)
+
+        delayed = self.build()
+        delayed.run_until(2)
+        delayed.switch_mode("B", "after_job")
+        self.assertEqual(delayed.mode, "A")
+        delayed.run_until(3)
+        self.assertEqual(delayed.mode, "A")
+        delayed.run_until(4)
+        self.assertEqual(delayed.mode, "B")
+        delayed.run_until(5)
+
+        self.assertEqual(
+            [(e.time, e.mode, e.strategy, e.target_jid)
+             for e in delayed.mode_events],
+            [(0, "A", "initial", None),
+             (4, "B", "after_job", 0)],
+        )
+        self.assertEqual(delayed.jobs[0].abs_deadline, 10)
+
+    def test_switch_at_deadline_does_not_rewrite_old_responsibility(self):
+        system = System(
+            tasks=[TaskSpec("T", 1, [run(5)], period=10,
+                            deadline=4)],
+            costs=Costs(context_switch=0),
+            modes=[ModeSpec("A"), ModeSpec("B")],
+            initial_mode="A",
+        )
+        system.run_until(3)
+        system.switch_mode("B", "immediate", at_time=4)
+        system.run_until(5)
+
+        miss = system.misses[0]
+        self.assertEqual((miss.release_mode, miss.deadline_mode),
+                         ("A", "B"))
+        self.assertEqual(miss.remaining_work, 1)
+        explanation = explain_miss(system, miss.jid)
+        self.assertEqual(explanation.categories["self_run"], 4)
+        self.assertEqual(set(explanation.mode_breakdown), {"A"})
+        self.assertEqual(explanation.mode_breakdown["A"]["self_run"], 4)
+
+
+class TestModeLockBudgetAndInheritance(unittest.TestCase):
+    def build(self):
+        return System(
+            tasks=[
+                TaskSpec("L", 1,
+                         [lock("R"), run(3), unlock("R")],
+                         period=100),
+                TaskSpec("H", 3, [lock("R"), run(1), unlock("R")],
+                         period=100, offset=2, deadline=100),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+            modes=[
+                ModeSpec("A", lock_budgets={"R": 2}),
+                ModeSpec("B", lock_budgets={"R": 100}),
+            ],
+            initial_mode="A",
+        )
+
+    def test_cross_mode_inheritance_uses_acquisition_mode_budget(self):
+        sys_ = self.build()
+        sys_.run_until(1)
+        sys_.switch_mode("B", "immediate")
+        sys_.run_until(3)
+
+        low, high = sys_.jobs
+        self.assertEqual(low.held, ["R"])
+        self.assertEqual(high.state, "blocked")
+        self.assertEqual(high.lock_request_mode, "B")
+        self.assertEqual(low.boost, 2)  # 跨 A/B 的等待仍传递优先级
+        self.assertEqual(sys_.resources["R"]["mode"], "A")
+        self.assertEqual(sys_.resources["R"]["budget"], 2)
+
+        sys_.run_until(6)
+        self.assertEqual(low.completed_at, 6)
+        self.assertEqual(high.mode, "B")
+        violation, = sys_.lock_budget_violations
+        self.assertEqual(
+            (violation.resource, violation.task, violation.mode,
+             violation.acquired_at, violation.budget,
+             violation.overrun, violation.elapsed_at_violation,
+             violation.released_at),
+            ("R", "L", "A", 1, 2, 1, 3, 6),
+        )
+
+
+class TestNestedInterrupts(unittest.TestCase):
+    def test_higher_priority_isr_preempts_lower_isr(self):
+        sys_ = System(
+            tasks=[TaskSpec("A", 1, [run(10)], period=100)],
+            interrupts=[
+                InterruptSource("Low", [1], service=3, priority=1),
+                InterruptSource("High", [2], service=1, priority=2),
+            ],
+            costs=Costs(context_switch=0),
+        )
+        sys_.run_until(7)
+        self.assertEqual(
+            [(s.start, s.end, s.kind, s.detail)
+             for s in sys_.trace if s.kind in ("isr", "task")],
+            [
+                (0, 1, "task", "A#0"),
+                (1, 2, "isr", "isr:Low"),
+                (2, 3, "isr", "isr:High"),
+                (3, 5, "isr", "isr:Low"),
+                (5, 7, "task", "A#0"),
+            ],
+        )
+
+
+class TestModeSnapshot(unittest.TestCase):
+    def test_pending_after_job_switch_resumes_on_same_timeline(self):
+        def build():
+            return System(
+                tasks=[TaskSpec("T", 1, [run(4)], period=10)],
+                costs=Costs(context_switch=0),
+                modes=[ModeSpec("A"), ModeSpec("B")],
+                initial_mode="A",
+            )
+
+        whole = build()
+        whole.run_until(2)
+        whole.switch_mode("B", "after_job")
+        whole.run_until(8)
+
+        partial = build()
+        partial.run_until(2)
+        partial.switch_mode("B", "after_job")
+        partial.run_until(3)
+        reopened = System.restore(partial.snapshot())
+        reopened.run_until(8)
+
+        self.assertEqual(segs(whole), segs(reopened))
+        self.assertEqual(
+            [(e.time, e.mode, e.strategy, e.target_jid)
+             for e in whole.mode_events],
+            [(e.time, e.mode, e.strategy, e.target_jid)
+             for e in reopened.mode_events],
+        )
 
 
 if __name__ == "__main__":

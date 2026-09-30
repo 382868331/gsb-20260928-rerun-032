@@ -7,6 +7,7 @@
 from .model import (
     Costs,
     InterruptSource,
+    ModeSpec,
     Step,
     TaskSpec,
     lock,
@@ -19,6 +20,7 @@ from .explain import MissExplanation, explain_miss
 __all__ = [
     "Costs",
     "InterruptSource",
+    "ModeSpec",
     "Step",
     "TaskSpec",
     "lock",
