@@ -50,3 +50,26 @@ whole.run_until(25)
 same = [ (s.start,s.end,s.kind,s.detail) for s in sys2b.trace ] == \
        [ (s.start,s.end,s.kind,s.detail) for s in whole.trace ]
 print("断点续跑与一次跑完的执行记录一致:", same)
+
+print()
+print("=== 多把锁的嵌套等待链：继承沿等待关系传播 ===")
+chain = System(
+    tasks=[
+        TaskSpec("L", 1, [lock("Q"), run(5), unlock("Q")], period=100),
+        TaskSpec("M", 2, [lock("R"), run(1), lock("Q"), run(1),
+                          unlock("Q"), unlock("R")],
+                 period=100, offset=2),
+        TaskSpec("H", 3, [lock("R"), run(1), unlock("R")],
+                 period=100, offset=5),
+    ],
+    costs=Costs(1, 1, 1),
+)
+chain.run_until(9)
+j = {x.task.name: x for x in chain.jobs}
+print("M 被 H 等 R 顶起：eff =", j["M"].eff_priority, "boost =", j["M"].boost)
+print("L 沿 M->Q 等待链被顶起：eff =", j["L"].eff_priority,
+      "boost =", j["L"].boost)
+chain.run_until(25)
+j = {x.task.name: x for x in chain.jobs}
+print("解除后恢复：M boost =", j["M"].boost, "，H 完成于",
+      j["H"].completed_at)

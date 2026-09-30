@@ -122,6 +122,110 @@ class TestInterrupt(unittest.TestCase):
     手算：switch[0,1) A[1,2) isr[2,6) A[6,10)
     """
 
+
+def nested_chain_tasks():
+    """多把锁的嵌套等待链：L 持 Q；M 持 R 后等 Q；H 等 R。
+
+    继承沿等待关系传播：H(3) 等 R -> M 提升到 3；
+    M(已为 3) 又等 Q -> L 也提升到 3。
+    """
+    return [
+        TaskSpec("L", 1, [lock("Q"), run(5), unlock("Q")], period=100),
+        TaskSpec("M", 2, [lock("R"), run(1), lock("Q"), run(1),
+                          unlock("Q"), unlock("R")],
+                 period=100, offset=2),
+        TaskSpec("H", 3, [lock("R"), run(1), unlock("R")],
+                 period=100, offset=5),
+    ]
+
+
+class TestNestedChainInheritance(unittest.TestCase):
+    """逐拍（开销全 1）：
+
+    switch[0,1) L-lockQ[1,2) switch[2,3) M-lockR[3,4) M[4,5)
+    switch[5,6) H-lockR[6,7)(阻塞；M 立即继承到 3)
+    switch[7,8) M-lockQ[8,9)(阻塞；继承沿链传播，L 提升到 3)
+    switch[9,10) L[10,15) L-unlockQ[15,16)(L 完成，解除继承)
+    switch[16,17) M-lockQ[17,18) M[18,19) M-unlockQ[19,20)
+    M-unlockR[20,21)(M 完成) switch[21,22) H-lockR[22,23)
+    H[23,24) H-unlockR[24,25)
+    """
+
+    def _jobs(self, sys_):
+        return {j.task.name: j for j in sys_.jobs}
+
+    def test_timeline_and_boost_propagation(self):
+        sys_ = System(tasks=nested_chain_tasks(), costs=COSTS)
+        sys_.run_until(9)  # 推进到 M 阻塞在 Q 的拍末
+        jobs = self._jobs(sys_)
+        # 直接等待：H 等 R（M 持有），M 提升到 H 的优先级
+        self.assertEqual(jobs["H"].state, "blocked")
+        self.assertEqual(jobs["M"].boost, 1)
+        self.assertEqual(jobs["M"].eff_priority, 3)
+        # 传递等待：M(有效3) 等 Q（L 持有），L 沿链提升到 3
+        self.assertEqual(jobs["M"].blocked_on, "Q")
+        self.assertEqual(jobs["L"].boost, 2)
+        self.assertEqual(jobs["L"].eff_priority, 3)
+
+        sys_.run_until(15)  # L 以提升后的优先级跑完 5 拍临界区
+        jobs = self._jobs(sys_)
+        self.assertEqual(jobs["L"].boost, 2)
+        self.assertEqual(jobs["L"].eff_priority, 3)
+
+        sys_.run_until(16)  # L 放 Q 并完成：解除继承，boost 归零
+        jobs = self._jobs(sys_)
+        self.assertEqual(jobs["L"].completed_at, 16)
+        self.assertEqual(jobs["L"].boost, 0)
+        # M 仍因 H 等 R 而保持继承来的优先级 3
+        self.assertEqual(jobs["M"].eff_priority, 3)
+        self.assertEqual(jobs["M"].boost, 1)
+
+        sys_.run_until(25)
+        jobs = self._jobs(sys_)
+        # M 放掉 R 后恢复自身优先级；H 得以跑完
+        self.assertEqual(jobs["M"].completed_at, 21)
+        self.assertEqual(jobs["H"].completed_at, 25)
+        self.assertEqual(jobs["M"].boost, 0)
+        self.assertEqual(jobs["H"].boost, 0)
+        self.assertEqual(
+            segs(sys_),
+            [
+                (0, 1, "switch", "switch->L#0"),
+                (1, 2, "lock", "L#0 lock Q"),
+                (2, 3, "switch", "switch->M#1"),
+                (3, 4, "lock", "M#1 lock R"),
+                (4, 5, "task", "M#1"),
+                (5, 6, "switch", "switch->H#2"),
+                (6, 7, "lock", "H#2 lock R"),
+                (7, 8, "switch", "switch->M#1"),
+                (8, 9, "lock", "M#1 lock Q"),
+                (9, 10, "switch", "switch->L#0"),
+                (10, 15, "task", "L#0"),
+                (15, 16, "unlock", "L#0 unlock Q"),
+                (16, 17, "switch", "switch->M#1"),
+                (17, 18, "lock", "M#1 lock Q"),
+                (18, 19, "task", "M#1"),
+                (19, 20, "unlock", "M#1 unlock Q"),
+                (20, 21, "unlock", "M#1 unlock R"),
+                (21, 22, "switch", "switch->H#2"),
+                (22, 23, "lock", "H#2 lock R"),
+                (23, 24, "task", "H#2"),
+                (24, 25, "unlock", "H#2 unlock R"),
+            ],
+        )
+        assert_contiguous(self, sys_, 25)
+
+    def test_no_inheritance_no_chain_boost(self):
+        """关闭继承：不存在任何 boost 传播；L 放锁前 H 一直阻塞在 R 上。"""
+        sys_ = System(tasks=nested_chain_tasks(), costs=COSTS,
+                      use_inheritance=False)
+        sys_.run_until(16)
+        jobs = self._jobs(sys_)
+        self.assertEqual(jobs["L"].boost, 0)
+        self.assertEqual(jobs["M"].boost, 0)
+        self.assertEqual(jobs["H"].state, "blocked")
+        self.assertEqual(jobs["H"].blocked_on, "R")
+
     def test_isr_timeline(self):
         sys_ = System(
             tasks=[TaskSpec("A", 1, [run(5)], period=100)],
@@ -165,6 +269,82 @@ class TestDeadlineMissExplanation(unittest.TestCase):
         self.assertEqual(ex.categories["inversion"], 4)
         self.assertEqual(ex.inversions, {"L": 4})
         self.assertIn("优先级反转", ex.report())
+
+    def test_report_frozen_at_deadline(self):
+        """截止瞬间还差一拍；作业在截止之后补完，报告不得改口为零拍。"""
+        sys_ = System(tasks=inversion_tasks(h_deadline=10), costs=COSTS,
+                      use_inheritance=True)
+        sys_.run_until(21)  # H 完成于 15（截止 13 之后）
+        h_job = next(j for j in sys_.jobs if j.task.name == "H")
+        self.assertEqual(h_job.completed_at, 15)
+        self.assertEqual(h_job.remaining_work(), 0)  # 事后状态：已经做完
+
+        ex = explain_miss(sys_, h_job.jid)
+        # 错过记录与文字解释都以截止瞬间冻结的剩余量为准
+        self.assertEqual(sys_.misses[0].remaining_work, 1)
+        self.assertEqual(ex.remaining_work, 1)
+        self.assertIn("截止瞬间还差 1 拍", ex.report())
+        self.assertTrue(ex.work_consistent)
+        # 错过记录、时间轴、文字解释三者工作量对账：1 已执行 + 1 剩余 = WCET 2
+        self.assertEqual(
+            ex.categories["self_run"] + ex.remaining_work, h_job.task.wcet
+        )
+
+    def test_report_stable_after_snapshot_reopen(self):
+        """保存重开后继续生成报告，不能改变已经发生的超期事实。"""
+        sys_ = System(tasks=inversion_tasks(h_deadline=10), costs=COSTS)
+        sys_.run_until(21)
+        frozen = [(m.jid, m.task, m.deadline, m.remaining_work)
+                  for m in sys_.misses]
+        data = sys_.snapshot()
+
+        reopened = System.restore(data)
+        reopened.run_until(60)
+        self.assertEqual(
+            [(m.jid, m.task, m.deadline, m.remaining_work)
+             for m in reopened.misses],
+            frozen,
+        )
+        ex = explain_miss(reopened, frozen[0][0])
+        self.assertEqual(ex.remaining_work, 1)
+        self.assertTrue(ex.consistent)
+        self.assertTrue(ex.work_consistent)
+
+    def test_interrupt_arriving_exactly_at_deadline(self):
+        """中断在截止拍 t=13 触发：服务拍全部落在窗口外，不占窗口归因。"""
+        sys_ = System(
+            tasks=inversion_tasks(h_deadline=10),
+            interrupts=[InterruptSource("Tick", [13], service=2)],
+            costs=COSTS,
+        )
+        sys_.run_until(25)
+        h_job = next(j for j in sys_.jobs if j.task.name == "H")
+        self.assertEqual(h_job.completed_at, 17)
+        ex = explain_miss(sys_, h_job.jid)
+        self.assertEqual(ex.categories["interrupt"], 0)
+        self.assertEqual(ex.interrupts, {})
+        # 窗口 [3,13) 外的 [13,15) ISR 拍出现在时间轴上，但不改变截止事实
+        isr_segs = [s for s in sys_.trace if s.kind == "isr"]
+        self.assertEqual([(s.start, s.end) for s in isr_segs], [(13, 15)])
+        self.assertTrue(ex.consistent)
+        self.assertTrue(ex.work_consistent)
+
+    def test_lock_holder_preempted_no_inheritance(self):
+        """关闭继承：锁持有者 L 被 M 抢占，H 被动等待，逐段对账阻塞责任。"""
+        sys_ = System(tasks=inversion_tasks(h_deadline=10), costs=COSTS,
+                      use_inheritance=False)
+        sys_.run_until(25)
+        h_job = next(j for j in sys_.jobs if j.task.name == "H")
+        self.assertEqual(h_job.completed_at, 19)
+        ex = explain_miss(sys_, h_job.jid)
+        # 窗口 [3,13)：自身1 + 自身lock 1 + 切换3 + M 运行3 + L 运行2 = 10；
+        # H 全程未被真正调度执行，M/L 占的拍都归为阻塞（优先级反转）。
+        self.assertTrue(ex.consistent)
+        self.assertTrue(ex.work_consistent)
+        self.assertEqual(ex.preemptions, {})
+        self.assertEqual(ex.inversions, {"M": 3, "L": 2})
+        self.assertEqual(ex.categories["preempted"], 0)
+        self.assertEqual(ex.categories["inversion"], 5)
 
 
 class TestSnapshotResume(unittest.TestCase):

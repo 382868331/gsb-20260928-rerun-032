@@ -181,6 +181,8 @@ class System:
         if res["holder"] is job:
             res["holder"] = None
             job.held.remove(res_name)
+            # 等待者回到就绪态，被调度到时重新执行 lock 系统调用竞争锁；
+            # 未抢到者再次阻塞，其继承压力随之重新挂到新持有者上。
             for w in list(res["waiters"]):
                 w.state = "ready"
                 w.blocked_on = None
@@ -198,6 +200,7 @@ class System:
         else:
             job.state = "done"
             job.completed_at = self.now + 1
+            job.boost = 0  # 解除后恢复：完成作业不再向任何持有者传递优先级
             if self.current is job:
                 self.current = None
 

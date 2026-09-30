@@ -1,9 +1,11 @@
 """错过截止时间的归因解释。
 
-思路：把 [release, deadline] 窗口内的逐段执行记录分类汇总，
+思路：把 [release, deadline) 窗口内的逐段执行记录分类汇总，
 窗口里的每一拍都必须有归属——自己执行、系统开销（切换/系统调用）、
 中断、被高优先级抢占、被低优先级阻塞（优先级反转）或空转。
 各项之和恒等于窗口长度，因此“为什么错过”可以完全核算。
+注意：剩余工作量必须取自截止瞬间冻结的 MissRecord，不能事后读作业
+当前状态，否则截止后补完的作业会被误解释成“剩余零拍”。
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-from .system import Job, System
+from .system import Job, MissRecord, System
 
 
 @dataclass
@@ -27,11 +29,17 @@ class MissExplanation:
     interrupts: Dict[str, int]        # 中断源名 -> 拍数
     accounted: int                    # 已归因总拍数
     window: int                       # 窗口长度 = deadline - release
+    wcet: int                         # 作业 WCET（run 拍总数）
     lines: List[str] = field(default_factory=list)
 
     @property
     def consistent(self) -> bool:
         return self.accounted == self.window
+
+    @property
+    def work_consistent(self) -> bool:
+        """自身已执行拍数 + 截止瞬间剩余拍数 必须恒等于 WCET。"""
+        return self.categories["self_run"] + self.remaining_work == self.wcet
 
     def report(self) -> str:
         return "\n".join(self.lines)
@@ -41,6 +49,10 @@ def explain_miss(sys: System, jid: int) -> MissExplanation:
     job = _find_job(sys, jid)
     release, deadline = job.release, job.abs_deadline
     window = deadline - release
+    miss = _find_miss(sys, jid)
+    # 必须使用截止瞬间冻结的剩余工作量，不能事后再读 job.remaining_work()：
+    # 作业可能在截止之后补完，事后状态会把“还差一拍”误报成“剩余零拍”。
+    remaining_at_deadline = miss.remaining_work
 
     cats: Dict[str, int] = {
         "self_run": 0,        # 自己在执行计算
@@ -86,22 +98,31 @@ def explain_miss(sys: System, jid: int) -> MissExplanation:
 
     accounted = sum(cats.values())
     lines = _build_lines(
-        job, window, cats, preemptions, inversions, interrupts, accounted
+        job, window, cats, preemptions, inversions, interrupts, accounted,
+        remaining_at_deadline,
     )
     return MissExplanation(
         jid=jid,
         task=job.task.name,
         release=release,
         deadline=deadline,
-        remaining_work=job.remaining_work(),
+        remaining_work=remaining_at_deadline,
         categories=cats,
         preemptions=preemptions,
         inversions=inversions,
         interrupts=interrupts,
         accounted=accounted,
         window=window,
+        wcet=job.task.wcet,
         lines=lines,
     )
+
+
+def _find_miss(sys: System, jid: int) -> MissRecord:
+    for record in sys.misses:
+        if record.jid == jid:
+            return record
+    raise KeyError("job with jid=%r has no deadline-miss record" % (jid,))
 
 
 def _find_job(sys: System, jid: int) -> Job:
@@ -112,13 +133,13 @@ def _find_job(sys: System, jid: int) -> Job:
 
 
 def _build_lines(job, window, cats, preemptions, inversions,
-                 interrupts, accounted) -> List[str]:
+                 interrupts, accounted, remaining) -> List[str]:
     lines = []
     lines.append(
         "任务 %s 的作业 #%d 错过截止时间：窗口 [%d, %d) 共 %d 拍，"
-        "截止时还差 %d 拍计算。"
+        "截止瞬间还差 %d 拍计算（WCET %d 拍，窗口内已执行 %d 拍）。"
         % (job.task.name, job.jid, job.release, job.abs_deadline,
-           window, job.remaining_work())
+           window, remaining, job.task.wcet, cats["self_run"])
     )
     lines.append(
         "- 自身执行 %d 拍（含系统调用 %d 拍）"
@@ -140,8 +161,16 @@ def _build_lines(job, window, cats, preemptions, inversions,
         )
     if cats["idle"]:
         lines.append("- 空转 %d 拍" % cats["idle"])
+    work_ok = cats["self_run"] + remaining == job.task.wcet
     lines.append(
-        "合计 %d/%d 拍已归因%s。"
-        % (accounted, window, "" if accounted == window else "（不一致！）")
+        "合计 %d/%d 拍已归因%s；工作量对账：窗口内自身执行 %d 拍 + "
+        "截止瞬间剩余 %d 拍 = %d/%d 拍%s。"
+        % (
+            accounted, window,
+            "" if accounted == window else "（不一致！）",
+            cats["self_run"], remaining,
+            cats["self_run"] + remaining, job.task.wcet,
+            "" if work_ok else "（不一致！）",
+        )
     )
     return lines
