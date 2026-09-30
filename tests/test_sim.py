@@ -210,5 +210,156 @@ class TestSnapshotResume(unittest.TestCase):
         self.assertEqual(segs(whole), segs(loaded))
 
 
+class TestDeadlineInstantAccounting(unittest.TestCase):
+    """A(wcet3, 相对截止2) 在 t=2 同刻被中断（服务2拍）抢占，t=6 才完成。
+
+    手算：switch[0,1) A[1,2) isr[2,4) A[4,6) idle[6,8)
+    截止时刻为 2，A 还差 2 拍；中断落在截止之后，不得计入窗口，
+    但要在“截止后逐段占用”里逐拍对得上。
+    """
+
+    def build(self):
+        return System(
+            tasks=[TaskSpec("A", 1, [run(3)], period=100, deadline=2)],
+            interrupts=[InterruptSource("T", [2], service=2)],
+            costs=COSTS,
+        )
+
+    def test_frozen_remaining_and_post_deadline_breakdown(self):
+        sys_ = self.build()
+        sys_.run_until(8)
+        job = sys_.jobs[0]
+        self.assertEqual(job.completed_at, 6)
+        self.assertEqual(len(sys_.misses), 1)
+        miss = sys_.misses[0]
+        # 截止瞬间冻结：还差 2 拍，事后完成不允许改写为 0
+        self.assertEqual(miss.remaining_work, 2)
+        self.assertEqual(job.deadline_remaining, 2)
+        self.assertEqual(miss.completed_at, 6)
+
+        ex = explain_miss(sys_, 0)
+        self.assertEqual(ex.remaining_work, 2)
+        self.assertTrue(ex.consistent)
+        # 窗口 [0,2)：切换 1 + 自身执行 1；同刻中断不在窗口内
+        self.assertEqual(ex.categories["self_run"], 1)
+        self.assertEqual(ex.categories["context_switch"], 1)
+        self.assertEqual(ex.categories["interrupt"], 0)
+        # 截止后 [2,6) 共 4 拍：中断 2 + 自身执行 2
+        self.assertEqual(ex.post_accounted, 4)
+        self.assertEqual(ex.post_categories["interrupt"], 2)
+        self.assertEqual(ex.post_categories["self_run"], 2)
+        self.assertEqual(ex.post_interrupts, {"T": 2})
+        report = ex.report()
+        self.assertIn("截止时还差 2 拍", report)
+        self.assertIn("截止之后才完成", report)
+
+    def test_resume_cannot_change_miss_fact(self):
+        """保存/重开后跑到作业完成，超期事实与冻结工作量保持不变。"""
+        part = self.build()
+        part.run_until(3)  # 错过已发生（t=2），作业尚未完成
+        data = part.snapshot()
+        resumed = System.restore(data)
+        resumed.run_until(8)
+
+        whole = self.build()
+        whole.run_until(8)
+        self.assertEqual(segs(whole), segs(resumed))
+        self.assertEqual(len(resumed.misses), 1)
+        self.assertEqual(resumed.misses[0].remaining_work, 2)
+        self.assertEqual(resumed.misses[0].completed_at, 6)
+        self.assertEqual(
+            explain_miss(resumed, 0).remaining_work,
+            explain_miss(whole, 0).remaining_work,
+        )
+
+
+class TestNestedLockInheritance(unittest.TestCase):
+    """双锁嵌套等待链：H 等 R2（M 持有），M 等 R1（L 持有）。
+
+    手算（含 K(优先级4) 在 t=11 释放抢占被提升的 L）：
+      switch[0,1) L-lockR1[1,2) switch[2,3) M-lockR2[3,4) M[4,5)
+      switch[5,6) H-lockR2[6,7)(阻塞) switch[7,8) M-lockR1[8,9)(阻塞)
+      switch[9,10) L[10,11) switch[11,12) K[12,14) switch[14,15)
+      L[15,16) L-unlockR1[16,17) switch[17,18) M-lockR1[18,19) M[19,20)
+      M-unlockR1[20,21) M-unlockR2[21,22) switch[22,23) H-lockR2[23,24)
+      H[24,25) H-unlockR2[25,26)
+    """
+
+    def build(self):
+        return System(tasks=nested_chain_tasks(with_k=True), costs=COSTS)
+
+    def test_transitive_propagation_preemption_and_restore(self):
+        sys_ = self.build()
+        sys_.run_until(12)
+        l, m, h, k = sys_.jobs
+        # 传递继承：H(3)->M 提升到 3(boost1)，M->L 提升到 4(boost2)，
+        # 因此 t=11 时即便 K(4) 释放，也能立刻抢占正在借优先级跑的 L。
+        self.assertEqual((h.boost, h.state, h.blocked_on), (0, "blocked", "R2"))
+        self.assertEqual((m.boost, m.state, m.blocked_on), (1, "blocked", "R1"))
+        self.assertEqual((l.boost, l.state), (2, "ready"))
+        self.assertEqual((k.state,), ("running",))
+
+        sys_.run_until(26)
+        self.assertEqual(
+            segs(sys_),
+            [
+                (0, 1, "switch", "switch->L#0"),
+                (1, 2, "lock", "L#0 lock R1"),
+                (2, 3, "switch", "switch->M#1"),
+                (3, 4, "lock", "M#1 lock R2"),
+                (4, 5, "task", "M#1"),
+                (5, 6, "switch", "switch->H#2"),
+                (6, 7, "lock", "H#2 lock R2"),
+                (7, 8, "switch", "switch->M#1"),
+                (8, 9, "lock", "M#1 lock R1"),
+                (9, 10, "switch", "switch->L#0"),
+                (10, 11, "task", "L#0"),
+                (11, 12, "switch", "switch->K#3"),
+                (12, 14, "task", "K#3"),
+                (14, 15, "switch", "switch->L#0"),
+                (15, 16, "task", "L#0"),
+                (16, 17, "unlock", "L#0 unlock R1"),
+                (17, 18, "switch", "switch->M#1"),
+                (18, 19, "lock", "M#1 lock R1"),
+                (19, 20, "task", "M#1"),
+                (20, 21, "unlock", "M#1 unlock R1"),
+                (21, 22, "unlock", "M#1 unlock R2"),
+                (22, 23, "switch", "switch->H#2"),
+                (23, 24, "lock", "H#2 lock R2"),
+                (24, 25, "task", "H#2"),
+                (25, 26, "unlock", "H#2 unlock R2"),
+            ],
+        )
+        done = {j.task.name: j.completed_at for j in sys_.jobs}
+        self.assertEqual(done, {"L": 17, "M": 22, "H": 26, "K": 14})
+        # 解锁后沿等待关系逐层恢复：所有提升归零
+        self.assertTrue(all(j.boost == 0 for j in sys_.jobs))
+
+    def test_no_transitive_inheritance_when_disabled(self):
+        """关闭继承：H 阻塞在 R2 上不会沿等待链提升 M、L。"""
+        sys_ = System(tasks=nested_chain_tasks(with_k=False),
+                      costs=COSTS, use_inheritance=False)
+        sys_.run_until(11)
+        self.assertTrue(all(j.boost == 0 for j in sys_.jobs))
+
+
+def nested_chain_tasks(with_k):
+    tasks = [
+        TaskSpec("L", 1,
+                 [lock("R1"), run(2), unlock("R1")],
+                 period=100),
+        TaskSpec("M", 2,
+                 [lock("R2"), run(1), lock("R1"), run(1),
+                  unlock("R1"), unlock("R2")],
+                 period=100, offset=2),
+        TaskSpec("H", 3,
+                 [lock("R2"), run(1), unlock("R2")],
+                 period=100, offset=5),
+    ]
+    if with_k:
+        tasks.append(TaskSpec("K", 4, [run(2)], period=100, offset=11))
+    return tasks
+
+
 if __name__ == "__main__":
     unittest.main()

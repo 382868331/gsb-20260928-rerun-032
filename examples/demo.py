@@ -50,3 +50,24 @@ whole.run_until(25)
 same = [ (s.start,s.end,s.kind,s.detail) for s in sys2b.trace ] == \
        [ (s.start,s.end,s.kind,s.detail) for s in whole.trace ]
 print("断点续跑与一次跑完的执行记录一致:", same)
+
+
+print()
+print("=== 多把锁嵌套等待：H 等 R2(M)、M 等 R1(L)，K 同刻抢占被提升的 L ===")
+chain = System(
+    tasks=[
+        TaskSpec("L", 1, [lock("R1"), run(2), unlock("R1")], period=100),
+        TaskSpec("M", 2, [lock("R2"), run(1), lock("R1"), run(1),
+                          unlock("R1"), unlock("R2")], period=100, offset=2),
+        TaskSpec("H", 3, [lock("R2"), run(1), unlock("R2")],
+                 period=100, offset=5),
+        TaskSpec("K", 4, [run(2)], period=100, offset=11),
+    ],
+    costs=Costs(context_switch=1, lock=1, unlock=1),
+)
+chain.run_until(26)
+for s in chain.trace:
+    print("  [%2d, %2d)  %-7s %s" % (s.start, s.end, s.kind, s.detail))
+print("完成时刻:",
+      {j.task.name: j.completed_at for j in chain.jobs},
+"；全部 boost 已恢复:", all(j.boost == 0 for j in chain.jobs))

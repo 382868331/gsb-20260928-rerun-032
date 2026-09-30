@@ -41,6 +41,7 @@ class Job:
     boost: int = 0                   # 继承得到的优先级增量
     completed_at: Optional[int] = None
     missed: bool = False
+    deadline_remaining: Optional[int] = None  # 截止瞬间冻结的剩余 run 拍数
     record: Dict = field(default_factory=dict)
 
     @property
@@ -81,6 +82,7 @@ class MissRecord:
     release: int
     deadline: int
     remaining_work: int
+    completed_at: Optional[int] = None  # 事后完成时刻（可能在截止之后）
 
 
 class System:
@@ -143,6 +145,9 @@ class System:
             changed = False
             for job in self.jobs:
                 if job.state == "done":
+                    if job.boost != 0:
+                        job.boost = 0
+                        changed = True
                     continue
                 want = 0
                 for res_name in job.held:
@@ -295,13 +300,20 @@ class System:
             if (not job.missed and job.state != "done"
                     and self.now >= job.abs_deadline):
                 job.missed = True
+                # 必须在这一刻冻结工作量：再往后跑（哪怕最终完成）
+                # 也不能改变“截止时还差几拍”这一历史事实。
+                job.deadline_remaining = job.remaining_work()
                 self.misses.append(MissRecord(
                     jid=job.jid,
                     task=job.task.name,
                     release=job.release,
                     deadline=job.abs_deadline,
-                    remaining_work=job.remaining_work(),
+                    remaining_work=job.deadline_remaining,
                 ))
+        for rec in self.misses:
+            job = self.jobs[rec.jid]
+            if rec.completed_at is None and job.state == "done":
+                rec.completed_at = job.completed_at
 
     @staticmethod
     def _label(job: Job) -> str:
