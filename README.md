@@ -55,10 +55,40 @@ priority inheritance）：任务阻塞在资源上时，持有者优先级立即
   结构本身不需要重新设计**。
 - 功耗按 trace 段结算即可：每段已知执行主体与时长。
 
+## 运行期工作模式
+
+`Mode(name, task_periods=, task_deadlines=, lock_budgets=)` 描述一套
+周期/相对截止/锁占用预算。`System(modes=[...], initial_mode=...)`
+启用后，trace 每一段都带 `mode` 标注。
+
+- **立即切换** `switch_mode(name)`：在当前拍边界生效；已经释放的作业
+  （执行一半、阻塞等锁）不重来——程序步、已耗时间、锁状态、释放时的
+  截止承诺全部保留；尚未到点的释放按新模式周期/截止重排。作业记录
+  `release_mode`/`deadline_mode`；`Job.lock_held_by_mode` 把每把锁的
+  持有拍按“拍所处模式”分桶。
+- **等当前作业结束** `switch_mode_after_jobs(name)`：只等登记请求时
+  已存在且未完成的作业（等待期间新释放的作业不延长等待），全部完成后
+  自动切换，`ModeChange.strategy` 为 `wait_job`。
+- **预定切换** `schedule_mode_switch(t, name)`：到点立即切换，便于对比；
+  切换恰好落在截止拍时该拍属新模式，窗口仍为 `[release, deadline)`
+  半开区间，截止承诺按作业的 `deadline_mode` 冻结，历史超期量不改写。
+- **跨模式锁继承**：持锁/等待关系跨切换保留，继承继续沿等待链传播；
+  锁占用预算按当前模式逐拍累计，越界冻结一条
+  `BudgetViolation(jid, resource, mode, time, held_in_mode, budget)`，
+  同一 (作业, 锁, 模式) 只在首次越界告警一次。
+- **中断嵌套**：`InterruptSource.priority` 高者抢占正在服务的低者，
+  服务结束后回到被抢占 ISR 继续；低者必须等高者结束。
+- **归因报告**：`explain_miss` 在窗口跨模式时给出“切换前后责任拆分”，
+  各模式的自身执行/切换/中断/抢占/阻塞拍数分别合计，总和仍恒等于
+  窗口长度；`MissRecord.deadline_mode` 标明截止承诺依据的模式。
+- **任意阶段保存恢复**：等待切换未生效、刚切换、持锁中等任何时刻
+  `snapshot()/restore()` 后续跑，trace、`mode_changes`、
+  `budget_violations`、作业完成时刻均与一次跑完逐拍一致。
+
 ## 布局
 
 - `embsim/model.py` — 任务/中断/资源/开销的静态模型
-- `embsim/system.py` — 虚拟处理器、调度器、继承、快照
+- `embsim/system.py` — 虚拟处理器、调度器、继承、模式切换、中断嵌套、快照
 - `embsim/explain.py` — 错过截止时间的归因解释
 - `tests/test_sim.py` — 手算核对的小例子（`python3 -m unittest discover -s tests`）
 - `examples/demo.py` — 端到端演示

@@ -12,6 +12,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from embsim import (
+    Mode,
     Costs,
     InterruptSource,
     System,
@@ -388,6 +389,232 @@ class TestSnapshotResume(unittest.TestCase):
         whole = self.scenario()
         whole.run_until(30)
         self.assertEqual(segs(whole), segs(loaded))
+
+
+class TestModeSwitching(unittest.TestCase):
+    """运行期切换工作模式。
+
+    H(优先级2)：4 拍程序 lockR/run2/unlockR/run1；
+    L(优先级1)：run8。normal 下 H 周期 10；boost 下 H 周期 6。
+    模式只改变“切换之后”的新释放作业；既有作业承诺不变。
+    """
+
+    def _build(self):
+        normal = Mode("normal", task_periods={"H": 10},
+                      task_deadlines={"H": 10},
+                      lock_budgets={"R": 5})
+        boost = Mode("boost", task_periods={"H": 6},
+                     task_deadlines={"H": 6},
+                     lock_budgets={"R": 5})
+        return System(
+            tasks=[
+                TaskSpec("H", 2,
+                         [lock("R"), run(2), unlock("R"), run(1)],
+                         period=10),
+                TaskSpec("L", 1, [run(8)], period=100),
+            ],
+            modes=[normal, boost], initial_mode="normal",
+            costs=COSTS,
+        )
+
+    def test_immediate_switch_keeps_old_promise(self):
+        sys_ = self._build()
+        sys_.run_until(5)
+        old_h = sys_.jobs[0]
+        self.assertEqual(old_h.abs_deadline, 10)
+        self.assertEqual(old_h.release_mode, "normal")
+        sys_.switch_mode("boost")  # t=5 立即切换
+        sys_.run_until(20)
+        # 旧作业承诺不被改写；尚未释放的作业从 t=5 起按 boost 周期 6
+        rels = [(j.task.name, j.release, j.abs_deadline, j.release_mode)
+                for j in sys_.jobs if j.task.name == "H"]
+        self.assertEqual(rels[0], ("H", 0, 10, "normal"))
+        self.assertEqual(rels[1], ("H", 11, 17, "boost"))
+        self.assertEqual(rels[2], ("H", 17, 23, "boost"))
+        change = sys_.mode_changes[-1]
+        self.assertEqual(
+            (change.time, change.old_mode, change.new_mode, change.strategy),
+            (5, "normal", "boost", "immediate"),
+        )
+        # 执行到一半的作业不重来：pc/已耗工作量延续，6 拍末完成
+        self.assertEqual(sys_.jobs[0].completed_at, 6)
+
+    def test_wait_job_switch_defers_until_current_jobs_done(self):
+        sys_ = self._build()
+        sys_.run_until(3)
+        sys_.switch_mode_after_jobs("boost")  # H、L 都未完成
+        sys_.run_until(6)  # H 在 6 完成，但 L 仍在跑 -> 不切换
+        self.assertEqual(sys_.mode_name, "normal")
+        sys_.run_until(30)  # L 在 29 完成后自动切换；新作业按 boost
+        self.assertEqual(sys_.mode_name, "boost")
+        change = sys_.mode_changes[-1]
+        self.assertEqual(change.strategy, "wait_job")
+        self.assertEqual(change.time, 29)
+        # 等待期间 H 仍按旧模式 10 拍周期释放（10、20），不延长等待
+        h_rels = [j.release for j in sys_.jobs if j.task.name == "H"]
+        self.assertEqual(h_rels[:3], [0, 10, 20])
+
+    def test_strategies_produce_distinct_mode_change_time(self):
+        imm = self._build()
+        imm.run_until(3)
+        imm.switch_mode("boost")
+        imm.run_until(40)
+        wait = self._build()
+        wait.run_until(3)
+        wait.switch_mode_after_jobs("boost")
+        wait.run_until(40)
+        t_imm = [c.time for c in imm.mode_changes if c.new_mode == "boost"][0]
+        t_wait = [c.time for c in wait.mode_changes
+                  if c.new_mode == "boost"][0]
+        self.assertEqual(t_imm, 3)
+        self.assertGreater(t_wait, t_imm)  # 等到当前作业集合全完成
+
+    def test_cross_mode_lock_budget_and_inheritance(self):
+        """持锁跨模式：占用按拍所处模式分别记账；继承不跨模式丢失。"""
+        normal = Mode("normal", lock_budgets={"R": 2})
+        boost = Mode("boost", lock_budgets={"R": 1})
+        sys_ = System(
+            tasks=[
+                # L 持锁临界区 4 拍；t=2 释放的 H 阻塞在 R 上
+                TaskSpec("L", 1,
+                         [lock("R"), run(4), unlock("R")], period=100),
+                TaskSpec("H", 3, [lock("R"), run(1), unlock("R")],
+                         period=100, offset=2),
+            ],
+            modes=[normal, boost], initial_mode="normal",
+            costs=COSTS,
+        )
+        sys_.run_until(2)  # L 已 lock R；H 在 t=3 才释放
+        sys_.run_until(7)  # H lock R 阻塞：L 继承 H 优先级
+        l_job = next(j for j in sys_.jobs if j.task.name == "L")
+        h_job = next(j for j in sys_.jobs if j.task.name == "H")
+        self.assertEqual(h_job.state, "blocked")
+        self.assertEqual(l_job.eff_priority, 3)
+        sys_.switch_mode("boost")  # 立即切换，L 仍持锁、H 仍等待
+        sys_.run_until(20)
+        # 继承压力跨模式保留：L 持续以 3 跑完临界区放锁
+        self.assertTrue(h_job.completed_at is not None)
+        self.assertTrue(h_job.completed_at is not None)
+        # 占用按模式拆分，且新模式预算(1)更紧：boost 下必然告警
+        held = l_job.lock_held_by_mode["R"]
+        self.assertIn("normal", held)
+        self.assertIn("boost", held)
+        modes_flagged = {v.mode for v in sys_.budget_violations
+                         if v.jid == l_job.jid and v.resource == "R"}
+        self.assertIn("boost", modes_flagged)
+        for v in sys_.budget_violations:
+            self.assertGreater(v.held_in_mode, v.budget)
+
+    def test_deadline_exactly_at_switch_responsibility_split(self):
+        """切换恰落在截止拍：截止窗口不含切换后拍；报告按模式拆分。"""
+        normal = Mode("normal", task_periods={"H": 10},
+                      task_deadlines={"H": 5}, lock_budgets={"R": 99})
+        boost = Mode("boost", task_periods={"H": 6},
+                     task_deadlines={"H": 6}, lock_budgets={"R": 99})
+        sys_ = System(
+            tasks=[
+                TaskSpec("H", 2,
+                         [lock("R"), run(3), unlock("R")],
+                        period=10),
+                TaskSpec("L", 1, [run(8)], period=100),
+            ],
+            interrupts=[InterruptSource("Tick", [3], service=1)],
+            modes=[normal, boost], initial_mode="normal",
+            costs=Costs(context_switch=0, lock=0, unlock=0),
+        )
+        # H 截止为 6；安排 t=6 切换（截止拍，窗口 [0,6) 之外）
+        sys_.schedule_mode_switch(5, "boost")
+        sys_.run_until(12)
+        h0 = sys_.jobs[0]
+        self.assertEqual(h0.abs_deadline, 5)
+        self.assertTrue(h0.missed)
+        miss = sys_.misses[0]
+        self.assertEqual(miss.deadline_mode, "normal")
+        ex = explain_miss(sys_, h0.jid)
+        # 窗口拍全部在 normal；boost 的拍不得计入窗口、不改写超期量
+        self.assertEqual(ex.window, 5)
+        self.assertTrue(ex.consistent)
+        self.assertIn("normal", ex.by_mode)
+        # 冻结剩余量在继续运行/切换后保持不变
+        frozen = miss.remaining_work
+        sys_.run_until(30)
+        self.assertEqual(sys_.misses[0].remaining_work, frozen)
+        self.assertEqual(explain_miss(sys_, h0.jid).remaining_work, frozen)
+
+    def test_snapshot_during_switch_phase_replays_timeline(self):
+        """任意切换阶段（等待切换未生效、刚切换、持锁中）保存恢复一致。"""
+        for checkpoint in (2, 4, 6, 9):
+            whole = self._build()
+            whole.run_until(3)
+            whole.switch_mode_after_jobs("boost")
+            whole.run_until(40)
+
+            part = self._build()
+            part.run_until(3)
+            part.switch_mode_after_jobs("boost")
+            part.run_until(checkpoint)
+            data = part.snapshot()
+            resumed = System.restore(data)
+            resumed.run_until(40)
+            self.assertEqual(segs(whole), segs(resumed))
+            self.assertEqual(
+                [(c.time, c.old_mode, c.new_mode, c.strategy)
+                 for c in whole.mode_changes],
+                [(c.time, c.old_mode, c.new_mode, c.strategy)
+                 for c in resumed.mode_changes],
+            )
+            self.assertEqual(
+                [(v.jid, v.resource, v.mode, v.time, v.held_in_mode)
+                 for v in whole.budget_violations],
+                [(v.jid, v.resource, v.mode, v.time, v.held_in_mode)
+                 for v in resumed.budget_violations],
+            )
+            done_w = {j.jid: j.completed_at for j in whole.jobs}
+            done_r = {j.jid: j.completed_at for j in resumed.jobs}
+            self.assertEqual(done_w, done_r)
+
+
+class TestNestedInterrupts(unittest.TestCase):
+    """高优先级中断可抢占嵌套低优先级中断；trace 逐拍可见进出。"""
+
+    def test_nested_isr_timeline(self):
+        sys_ = System(
+            tasks=[TaskSpec("A", 1, [run(8)], period=100)],
+            interrupts=[
+                InterruptSource("Lo", [2], service=4, priority=1),
+                InterruptSource("Hi", [4], service=2, priority=2),
+            ],
+            costs=COSTS,
+        )
+        sys_.run_until(12)
+        kinds = [(s.start, s.end, s.kind, s.detail) for s in sys_.trace]
+        # A[1,2) 后 Lo 服务；t=4 Hi 抢占；Hi 结束后回到 Lo 剩余拍
+        self.assertIn((2, 4, "isr", "isr:Lo"), kinds)
+        self.assertIn((4, 6, "isr", "isr:Hi"), kinds)
+        # Lo 总 4 拍：[2,4) 两拍 + Hi 后两拍
+        self.assertIn((6, 8, "isr", "isr:Lo"), kinds)
+        lo_ticks = sum(e - b for b, e, k, d in kinds if d == "isr:Lo")
+        hi_ticks = sum(e - b for b, e, k, d in kinds if d == "isr:Hi")
+        self.assertEqual(lo_ticks, 4)
+        self.assertEqual(hi_ticks, 2)
+        assert_contiguous(self, sys_, 12)
+
+    def test_lower_priority_waits_until_isr_done(self):
+        sys_ = System(
+            tasks=[TaskSpec("A", 1, [run(8)], period=100)],
+            interrupts=[
+                InterruptSource("Hi", [2], service=3, priority=3),
+                InterruptSource("Lo", [3], service=2, priority=1),
+            ],
+            costs=COSTS,
+        )
+        sys_.run_until(10)
+        kinds = [(s.start, s.kind, s.detail) for s in sys_.trace]
+        # Lo 在 t=3 触发但 Hi 在服务：必须等 Hi 结束，不能插入
+        hi_span = [s for s in sys_.trace if s.detail == "isr:Hi"]
+        lo_span = [s for s in sys_.trace if s.detail == "isr:Lo"]
+        self.assertEqual(hi_span[0].start, 2)
+        self.assertEqual(lo_span[0].start, hi_span[-1].end)
 
 
 if __name__ == "__main__":

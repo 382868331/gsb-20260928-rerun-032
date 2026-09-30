@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from .system import Job, MissRecord, System
 
@@ -30,6 +30,8 @@ class MissExplanation:
     accounted: int                    # 已归因总拍数
     window: int                       # 窗口长度 = deadline - release
     wcet: int                         # 作业 WCET（run 拍总数）
+    deadline_mode: Optional[str] = None   # 截止承诺归属模式（冻结）
+    by_mode: Dict[str, Dict[str, int]] = field(default_factory=dict)
     lines: List[str] = field(default_factory=list)
 
     @property
@@ -66,6 +68,7 @@ def explain_miss(sys: System, jid: int) -> MissExplanation:
     preemptions: Dict[str, int] = {}
     inversions: Dict[str, int] = {}
     interrupts: Dict[str, int] = {}
+    by_mode: Dict[str, Dict[str, int]] = {}
 
     for seg in sys.trace:
         lo = max(seg.start, release)
@@ -73,33 +76,41 @@ def explain_miss(sys: System, jid: int) -> MissExplanation:
         if hi <= lo:
             continue
         n = hi - lo
+        mkey = seg.mode if seg.mode else "(无模式)"
+        mbucket = by_mode.setdefault(mkey, {})
+        mbucket["total"] = mbucket.get("total", 0) + n
+
+        def _add(cat, n=n, mbucket=mbucket):
+            cats[cat] += n
+            mbucket[cat] = mbucket.get(cat, 0) + n
+
         if seg.kind == "task" and seg.jid == jid:
-            cats["self_run"] += n
+            _add("self_run")
         elif seg.kind in ("lock", "unlock") and seg.jid == jid:
-            cats["self_syscall"] += n
+            _add("self_syscall")
         elif seg.kind == "switch":
-            cats["context_switch"] += n
+            _add("context_switch")
         elif seg.kind == "isr":
-            cats["interrupt"] += n
+            _add("interrupt")
             name = seg.detail.split(":", 1)[1]
             interrupts[name] = interrupts.get(name, 0) + n
         elif seg.kind == "idle":
-            cats["idle"] += n
+            _add("idle")
         elif seg.jid is not None:
             other = _find_job(sys, seg.jid)
             if other.base_priority >= job.base_priority:
-                cats["preempted"] += n
+                _add("preempted")
                 preemptions[other.task.name] = (
                     preemptions.get(other.task.name, 0) + n)
             else:
-                cats["inversion"] += n
+                _add("inversion")
                 inversions[other.task.name] = (
                     inversions.get(other.task.name, 0) + n)
 
     accounted = sum(cats.values())
     lines = _build_lines(
         job, window, cats, preemptions, inversions, interrupts, accounted,
-        remaining_at_deadline,
+        remaining_at_deadline, miss.deadline_mode, by_mode,
     )
     return MissExplanation(
         jid=jid,
@@ -114,6 +125,8 @@ def explain_miss(sys: System, jid: int) -> MissExplanation:
         accounted=accounted,
         window=window,
         wcet=job.task.wcet,
+        deadline_mode=miss.deadline_mode,
+        by_mode=by_mode,
         lines=lines,
     )
 
@@ -133,13 +146,16 @@ def _find_job(sys: System, jid: int) -> Job:
 
 
 def _build_lines(job, window, cats, preemptions, inversions,
-                 interrupts, accounted, remaining) -> List[str]:
+                 interrupts, accounted, remaining,
+                 deadline_mode, by_mode) -> List[str]:
     lines = []
+    mode_note = "，截止承诺归属模式「%s」" % deadline_mode \
+        if deadline_mode is not None else ""
     lines.append(
         "任务 %s 的作业 #%d 错过截止时间：窗口 [%d, %d) 共 %d 拍，"
-        "截止瞬间还差 %d 拍计算（WCET %d 拍，窗口内已执行 %d 拍）。"
+        "截止瞬间还差 %d 拍计算（WCET %d 拍，窗口内已执行 %d 拍）%s。"
         % (job.task.name, job.jid, job.release, job.abs_deadline,
-           window, remaining, job.task.wcet, cats["self_run"])
+           window, remaining, job.task.wcet, cats["self_run"], mode_note)
     )
     lines.append(
         "- 自身执行 %d 拍（含系统调用 %d 拍）"
@@ -161,6 +177,27 @@ def _build_lines(job, window, cats, preemptions, inversions,
         )
     if cats["idle"]:
         lines.append("- 空转 %d 拍" % cats["idle"])
+    if len(by_mode) > 1:
+        lines.append("- 切换前后责任拆分（历史不回改）：")
+        for mname in sorted(by_mode):
+            mb = by_mode[mname]
+            parts = []
+            labels = [
+                ("self_run", "自身执行"),
+                ("self_syscall", "自身系统调用"),
+                ("context_switch", "切换"),
+                ("interrupt", "中断"),
+                ("preempted", "被高优先级抢占"),
+                ("inversion", "阻塞/反转"),
+                ("idle", "空转"),
+            ]
+            for key, label in labels:
+                if mb.get(key):
+                    parts.append("%s %d拍" % (label, mb[key]))
+            lines.append(
+                "    · 模式 %s：合计 %d 拍（%s）"
+                % (mname, mb.get("total", 0), "，".join(parts))
+            )
     work_ok = cats["self_run"] + remaining == job.task.wcet
     lines.append(
         "合计 %d/%d 拍已归因%s；工作量对账：窗口内自身执行 %d 拍 + "

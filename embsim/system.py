@@ -20,7 +20,7 @@ import pickle
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from .model import Costs, InterruptSource, TaskSpec
+from .model import Costs, InterruptSource, Mode, TaskSpec
 
 
 # ---------------------------------------------------------------- 运行态
@@ -41,6 +41,10 @@ class Job:
     boost: int = 0                   # 继承得到的优先级增量
     completed_at: Optional[int] = None
     missed: bool = False
+    release_mode: Optional[str] = None   # 释放时所处模式
+    deadline_mode: Optional[str] = None  # 承诺截止时刻所依据的模式
+    # 每把锁在各模式下的实际持有拍数：{资源: {模式: 拍数}}
+    lock_held_by_mode: Dict[str, Dict[str, int]] = field(default_factory=dict)
     record: Dict = field(default_factory=dict)
 
     @property
@@ -72,6 +76,7 @@ class Segment:
     kind: str      # task / lock / unlock / switch / isr / idle
     detail: str    # 如 "T1#0"、"isr:Timer"、"switch->T2#1"
     jid: Optional[int] = None
+    mode: str = ""  # 该拍所处工作模式（"" 表示未启用模式）
 
 
 @dataclass
@@ -81,6 +86,33 @@ class MissRecord:
     release: int
     deadline: int
     remaining_work: int
+    deadline_mode: Optional[str] = None  # 截止承诺归属的模式（冻结）
+
+
+@dataclass
+class ModeChange:
+    """一次工作模式切换（不可变历史，保存/恢复后必须逐拍重现）。"""
+
+    time: int
+    old_mode: Optional[str]
+    new_mode: Optional[str]
+    strategy: str  # immediate / wait_job / scheduled
+
+
+@dataclass
+class BudgetViolation:
+    """某模式下某把锁的持有占用超出该模式允许预算。
+
+    记账按“持锁拍发生时的当前模式”归类，因此跨模式持锁会在新模式下
+    继续累计并可能告警；历史告警不会因之后放锁或再次切换而被改写。
+    """
+
+    jid: int
+    resource: str
+    mode: Optional[str]
+    time: int                 # 首次越界的拍末时刻
+    held_in_mode: int         # 截止该拍在该模式下已持有拍数
+    budget: int               # 该模式允许预算
 
 
 class System:
@@ -90,11 +122,17 @@ class System:
         interrupts: Optional[List[InterruptSource]] = None,
         costs: Costs = Costs(),
         use_inheritance: bool = True,
+        modes: Optional[List[Mode]] = None,
+        initial_mode: Optional[str] = None,
     ):
         self.tasks = {t.name: t for t in tasks}
         self.interrupts = interrupts or []
         self.costs = costs
         self.use_inheritance = use_inheritance
+        self.modes: Dict[str, Mode] = {m.name: m for m in (modes or [])}
+        if initial_mode is not None:
+            assert initial_mode in self.modes, "未知模式: %r" % initial_mode
+        self.mode_name: Optional[str] = initial_mode
         self.resources: Dict[str, Dict] = {}
 
         self.now = 0
@@ -103,7 +141,7 @@ class System:
         self.current: Optional[Job] = None
         self._switch_to: Optional[Job] = None
         self._switch_left = 0
-        self._isr: Optional[Dict] = None   # {name, left}
+        self._isr_stack: List[Dict] = []    # ISR 嵌套栈：栈顶为正在服务者
         self._irq_pending: List[InterruptSource] = []
         self._next_release = {t.name: t.offset for t in tasks}
         self._irq_schedule = sorted(
@@ -113,19 +151,105 @@ class System:
         )
         self.trace: List[Segment] = []
         self.misses: List[MissRecord] = []
+        self.mode_changes: List[ModeChange] = []
+        self.budget_violations: List[BudgetViolation] = []
+        # 已记录越界的 (jid, resource, mode)，同一组合只在首次越界告警
+        self._budget_flagged: set = set()
+        # 模式切换请求：[(time, mode_name)]，到点立即切换
+        self._pending_switches: List = []
+        # “等作业结束”请求：[(mode_name, 登记时已存在的作业 jid 集合)]
+        self._pending_wait_switches: List = []
+
+    # ------------------------------------------------------------ 模式
+
+    @property
+    def mode(self) -> Optional[Mode]:
+        if self.mode_name is None:
+            return None
+        return self.modes[self.mode_name]
+
+    def _mode_label(self) -> str:
+        return self.mode_name or ""
+
+    def switch_mode(self, mode_name: Optional[str]) -> None:
+        """立即切换模式：在当前时刻（拍边界）生效。
+
+        已释放作业的周期/截止承诺不变，只调整未释放作业的后续释放表；
+        正在执行/阻塞的作业继续沿用各自程序步与锁状态。
+        """
+        if mode_name is not None and mode_name not in self.modes:
+            raise KeyError("未知模式: %r" % mode_name)
+        if mode_name == self.mode_name:
+            return
+        old = self.mode_name
+        self.mode_name = mode_name
+        self.mode_changes.append(
+            ModeChange(self.now, old, mode_name, "immediate")
+        )
+        self._reschedule_after_switch()
+
+    def switch_mode_after_jobs(self, mode_name: Optional[str]) -> None:
+        """登记“等当前作业结束后切换”：请求时已存在的未完成作业全部
+        done 后自动切换；等待期间新释放的作业不延长等待。"""
+        if mode_name is not None and mode_name not in self.modes:
+            raise KeyError("未知模式: %r" % mode_name)
+        witness = {j.jid for j in self.jobs if j.state != "done"}
+        self._pending_wait_switches.append((mode_name, witness))
+
+    def schedule_mode_switch(self, time: int, mode_name: Optional[str]) -> None:
+        """登记在指定时刻立即切换（用于对比/编排，含恰好落在截止拍）。"""
+        if mode_name is not None and mode_name not in self.modes:
+            raise KeyError("未知模式: %r" % mode_name)
+        self._pending_switches.append((time, mode_name))
+        self._pending_switches.sort(key=lambda x: x[0])
+
+    def _reschedule_after_switch(self):
+        """新周期从切换时刻起对“尚未释放”的作业生效。
+
+        已经释放（活在作业列表里）的作业承诺一律不动；尚未到点的下一次
+        释放是新模式时间线的一部分，重排为 now + 新模式周期，
+        从而保证新模式周期/截止参数对新作业立即生效、单一可追溯。
+        """
+        for t in self.tasks.values():
+            nxt = self._next_release[t.name]
+            if nxt > self.now:
+                self._next_release[t.name] = self.now + self._period_of(t)
+
+    def _period_of(self, task: TaskSpec) -> int:
+        m = self.mode
+        return task.period if m is None else m.period_of(task)
+
+    def _deadline_of(self, task: TaskSpec) -> int:
+        m = self.mode
+        return task.rel_deadline if m is None else m.deadline_of(task)
 
     # ------------------------------------------------------------ 释放与事件
 
     def _release_due(self):
+        # 1) 到点的预定模式切换（先于本拍释放，使“该拍属于哪个模式”唯一）
+        while self._pending_switches \
+                and self._pending_switches[0][0] <= self.now:
+            _, target = self._pending_switches.pop(0)
+            if target != self.mode_name:
+                old = self.mode_name
+                self.mode_name = target
+                self.mode_changes.append(
+                    ModeChange(self.now, old, target, "scheduled")
+                )
+                self._reschedule_after_switch()
+        # 2) 本拍到期的作业释放；释放时刻也在本拍内确定（同一拍内先释放，
+        #    随后才检查“等作业结束”切换，保证已存在作业至少经历一拍）。
         for t in self.tasks.values():
             if self.now == self._next_release[t.name]:
-                self._next_release[t.name] += t.period
+                self._next_release[t.name] += self._period_of(t)
                 job = Job(
                     jid=self._next_jid,
                     task=t,
                     release=self.now,
-                    abs_deadline=self.now + t.rel_deadline,
+                    abs_deadline=self.now + self._deadline_of(t),
                 )
+                job.release_mode = self.mode_name
+                job.deadline_mode = self.mode_name
                 if t.program and t.program[0].kind == "run":
                     job.step_left = t.program[0].arg
                 self._next_jid += 1
@@ -133,6 +257,23 @@ class System:
         while self._irq_schedule and self._irq_schedule[0][0] <= self.now:
             _, _, src = self._irq_schedule.pop(0)
             self._irq_pending.append(src)
+
+    def _apply_wait_switches(self):
+        """拍末检查：登记时已存在的作业全部完成，则切换到等待模式。"""
+        while self._pending_wait_switches:
+            target, witness = self._pending_wait_switches[0]
+            live = {j.jid: j for j in self.jobs}
+            if any(live[jid].state != "done"
+                   for jid in witness if jid in live):
+                return
+            self._pending_wait_switches.pop(0)
+            if target != self.mode_name:
+                old = self.mode_name
+                self.mode_name = target
+                self.mode_changes.append(
+                    ModeChange(self.now, old, target, "wait_job")
+                )
+                self._reschedule_after_switch()
 
     # ------------------------------------------------------------ 优先级继承
 
@@ -218,12 +359,16 @@ class System:
     # ------------------------------------------------------------ 记录
 
     def _emit(self, kind: str, detail: str, jid: Optional[int] = None):
+        mode = self._mode_label()
         if self.trace and self.trace[-1].end == self.now \
                 and self.trace[-1].kind == kind \
-                and self.trace[-1].detail == detail:
+                and self.trace[-1].detail == detail \
+                and self.trace[-1].mode == mode:
             self.trace[-1].end = self.now + 1
         else:
-            self.trace.append(Segment(self.now, self.now + 1, kind, detail, jid))
+            self.trace.append(
+                Segment(self.now, self.now + 1, kind, detail, jid, mode)
+            )
 
     # ------------------------------------------------------------ 主循环
 
@@ -231,16 +376,32 @@ class System:
         """推进一拍（切换决策本身不耗拍，切换开销在后续拍计入）。"""
         self._release_due()
 
-        # 中断触发：立即抢占（进入/退出开销已含在 ISR 总耗时内）
-        if self._isr is None and self._irq_pending:
-            src = self._irq_pending.pop(0)
-            self._isr = {"name": src.name, "left": src.total_cost}
+        # 中断嵌套：未决中断里优先级最高者，若高于栈顶 ISR 则抢占入栈；
+        # 同优先级按触发先后（_irq_pending 保序）。
+        if self._irq_pending:
+            top_pri = self._isr_stack[-1]["pri"] if self._isr_stack else None
+            idx = 0
+            best = 0
+            for src in self._irq_pending:
+                if top_pri is None or src.priority > top_pri:
+                    best = idx
+                    break
+                idx += 1
+            else:
+                best = -1
+            if best >= 0:
+                src = self._irq_pending.pop(best)
+                self._isr_stack.append(
+                    {"name": src.name, "left": src.total_cost,
+                     "pri": src.priority}
+                )
 
-        if self._isr is not None:
-            self._emit("isr", "isr:" + self._isr["name"])
-            self._isr["left"] -= 1
-            if self._isr["left"] == 0:
-                self._isr = None
+        if self._isr_stack:
+            isr = self._isr_stack[-1]
+            self._emit("isr", "isr:" + isr["name"])
+            isr["left"] -= 1
+            if isr["left"] == 0:
+                self._isr_stack.pop()
             self._finish_tick()
             return
 
@@ -293,6 +454,30 @@ class System:
             job.state = "running"
 
     def _finish_tick(self):
+        tick_mode = self.mode_name
+        # 锁占用预算：按“持锁拍发生时的当前模式”记账。每把被持有的锁
+        # 在每拍向持有者在该模式下累计 1 拍，越过预算即冻结一次告警。
+        for res_name, res in self.resources.items():
+            holder = res["holder"]
+            if holder is None:
+                continue
+            per_mode = holder.lock_held_by_mode.setdefault(res_name, {})
+            per_mode[tick_mode] = per_mode.get(tick_mode, 0) + 1
+            m = self.mode
+            budget = None if m is None else m.budget_of(res_name)
+            held = per_mode[tick_mode]
+            if budget is not None and held > budget:
+                key = (holder.jid, res_name, tick_mode)
+                if key not in self._budget_flagged:
+                    self._budget_flagged.add(key)
+                    self.budget_violations.append(BudgetViolation(
+                        jid=holder.jid,
+                        resource=res_name,
+                        mode=tick_mode,
+                        time=self.now + 1,
+                        held_in_mode=held,
+                        budget=budget,
+                    ))
         self.now += 1
         for job in self.jobs:
             if (not job.missed and job.state != "done"
@@ -304,7 +489,11 @@ class System:
                     release=job.release,
                     deadline=job.abs_deadline,
                     remaining_work=job.remaining_work(),
+                    deadline_mode=job.deadline_mode,
                 ))
+        # 截止检查之后再处理“等作业结束”切换：恰好截止拍完成的作业
+        # 在本拍仍属旧模式，切换只能从下一拍起生效。
+        self._apply_wait_switches()
 
     @staticmethod
     def _label(job: Job) -> str:

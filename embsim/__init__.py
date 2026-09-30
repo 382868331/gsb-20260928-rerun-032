@@ -7,18 +7,21 @@
 from .model import (
     Costs,
     InterruptSource,
+    Mode,
     Step,
     TaskSpec,
     lock,
     run,
     unlock,
 )
-from .system import Job, MissRecord, Segment, System
+from .system import (BudgetViolation, Job, MissRecord, ModeChange, Segment,
+                     System)
 from .explain import MissExplanation, explain_miss
 
 __all__ = [
     "Costs",
     "InterruptSource",
+    "Mode",
     "Step",
     "TaskSpec",
     "lock",
@@ -26,6 +29,8 @@ __all__ = [
     "unlock",
     "Job",
     "MissRecord",
+    "ModeChange",
+    "BudgetViolation",
     "Segment",
     "System",
     "MissExplanation",

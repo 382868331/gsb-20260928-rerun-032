@@ -6,7 +6,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from embsim import Costs, InterruptSource, System, TaskSpec, explain_miss
+from embsim import (Costs, InterruptSource, Mode, System, TaskSpec,
+                    explain_miss)
 from embsim import lock, run, unlock
 
 
@@ -73,3 +74,45 @@ chain.run_until(25)
 j = {x.task.name: x for x in chain.jobs}
 print("解除后恢复：M boost =", j["M"].boost, "，H 完成于",
       j["H"].completed_at)
+
+print()
+print("=== 运行期切换工作模式：立即切换 vs 等当前作业结束 ===")
+normal = Mode("normal", task_periods={"H": 10}, task_deadlines={"H": 10},
+              lock_budgets={"R": 5})
+boost = Mode("boost", task_periods={"H": 6}, task_deadlines={"H": 6},
+             lock_budgets={"R": 1})
+
+
+def mode_system():
+    return System(
+        tasks=[
+            TaskSpec("H", 2, [lock("R"), run(2), unlock("R"), run(1)],
+                     period=10),
+            TaskSpec("L", 1, [run(8)], period=100),
+        ],
+        modes=[normal, boost], initial_mode="normal",
+        costs=Costs(1, 1, 1),
+    )
+
+
+imm = mode_system()
+imm.run_until(3)
+imm.switch_mode("boost")          # 立即切换：旧作业承诺不变
+imm.run_until(40)
+wait = mode_system()
+wait.run_until(3)
+wait.switch_mode_after_jobs("boost")  # 等登记时已有的作业全部完成
+wait.run_until(40)
+c_imm = next(c for c in imm.mode_changes if c.new_mode == "boost")
+c_wait = next(c for c in wait.mode_changes if c.new_mode == "boost")
+print("立即切换生效时刻:", c_imm.time, "；等作业结束切换生效时刻:", c_wait.time)
+old_imm = next(j for j in imm.jobs if j.jid == 0)
+print("旧作业截止承诺保持:", old_imm.abs_deadline, "（释放模式",
+      old_imm.release_mode, "）")
+v = wait.budget_violations[-1]
+print("锁预算越界（按拍所处模式记账）：作业#%d 的 %s 在模式「%s」持有 %d 拍 > 预算 %d"
+      % (v.jid, v.resource, v.mode, v.held_in_mode, v.budget))
+h_miss = next((m for m in imm.misses if m.task == "H"), None)
+if h_miss is not None:
+    print()
+    print(explain_miss(imm, h_miss.jid).report())

@@ -78,6 +78,7 @@ class InterruptSource:
     service: int          # ISR 主体耗时（拍）
     entry: int = 0        # 进入开销（保存现场等）
     exit: int = 0         # 退出开销（恢复现场等）
+    priority: int = 0     # 中断优先级（大者高）：高者可嵌套抢占低者
 
     @property
     def total_cost(self) -> int:
@@ -106,3 +107,36 @@ class Resource:
     """互斥资源。持有者/等待队列在 System 运行态中维护。"""
 
     name: str
+
+
+# ---------------------------------------------------------------- 工作模式
+
+@dataclass
+class Mode:
+    """运行期工作模式。
+
+    模式只决定“切换之后新释放作业”的调度参数与锁占用预算，
+    绝不回改切换之前已经释放的作业（其周期承诺/截止时刻保持不变）。
+
+    task_periods:   各任务在该模式下的周期；缺省回落到 TaskSpec.period。
+    task_deadlines: 各任务在该模式下的相对截止；缺省回落到 TaskSpec.deadline。
+    lock_budgets:   每把锁在该模式下允许的连续持有预算（拍）。
+                    持锁跨过模式边界后，占用拍按“当前模式”记账，
+                    因此跨模式持锁可能触发新模式的预算告警。
+    """
+
+    name: str
+    task_periods: Dict[str, int] = field(default_factory=dict)
+    task_deadlines: Dict[str, Optional[int]] = field(default_factory=dict)
+    lock_budgets: Dict[str, int] = field(default_factory=dict)
+    attrs: Dict[str, Any] = field(default_factory=dict)
+
+    def period_of(self, task: TaskSpec) -> int:
+        return self.task_periods.get(task.name, task.period)
+
+    def deadline_of(self, task: TaskSpec) -> int:
+        rel = self.task_deadlines.get(task.name, task.deadline)
+        return task.period if rel is None else rel
+
+    def budget_of(self, resource: str) -> Optional[int]:
+        return self.lock_budgets.get(resource)
