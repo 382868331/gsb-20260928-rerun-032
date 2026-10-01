@@ -124,3 +124,30 @@ class ModeSpec:
     periods: Dict[str, int] = field(default_factory=dict)
     deadlines: Dict[str, int] = field(default_factory=dict)
     lock_budgets: Dict[str, int] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------- 关键程度承诺
+
+@dataclass
+class CriticalityCommitment:
+    """运行期临时关键程度承诺（让步策略的规格）。
+
+    name:       承诺标识；同一承诺可激活、撤回，多次提出按先后排队。
+    task:       获得临时高关键程度的任务名。
+    priority:   承诺生效期间该任务作业的有效关键级别（数值越大越高）。
+    deadline:   更紧的相对响应要求；只约束生效期间新释放的作业。
+    strategy:   对其他低关键作业的让步策略：
+                "inherit_only" 仅靠优先级继承，不主动延后任何作业；
+                "defer"       主动延后更低关键的就绪作业，但处于
+                              锁等待链上的持有者豁免（必须先把锁放出）。
+    """
+
+    name: str
+    task: str
+    priority: Optional[int] = None
+    deadline: Optional[int] = None
+    strategy: str = "defer"
+
+    def __post_init__(self):
+        if self.strategy not in ("inherit_only", "defer"):
+            raise ValueError("unknown concession strategy: %r" % self.strategy)

@@ -16,6 +16,31 @@ from typing import Dict, List
 from .system import Job, MissRecord, System
 
 
+def _job_deferred_intervals(sys: System, job: Job):
+    """由让步事件还原该作业处于延后态的 [t0, t1) 区间列表。"""
+    intervals = []
+    open_at = None
+    for e in sys.concession_events:
+        if e.jid != job.jid:
+            continue
+        if e.resumed_at is not None:
+            intervals.append((e.time, e.resumed_at))
+        else:
+            end = sys.now
+            state = next((j.state for j in sys.jobs
+                          if j.jid == job.jid), None)
+            if state == "deferred":
+                intervals.append((e.time, end))
+    return intervals
+
+
+def _is_deferred_during(sys: System, job: Job, lo: int, hi: int) -> bool:
+    for a, b in _job_deferred_intervals(sys, job):
+        if lo >= a and hi <= b:
+            return True
+    return False
+
+
 @dataclass
 class MissExplanation:
     jid: int
@@ -65,6 +90,7 @@ def explain_miss(sys: System, jid: int) -> MissExplanation:
         "idle": 0,            # 空转（自己未就绪/被阻塞且无人可跑）
         "preempted": 0,       # 被更高优先级任务抢占
         "inversion": 0,       # 低优先级任务运行造成的反转/阻塞
+        "conceded": 0,        # 本作业因让步策略被推迟期间流逝的拍
     }
     preemptions: Dict[str, int] = {}
     inversions: Dict[str, int] = {}
@@ -96,11 +122,19 @@ def explain_miss(sys: System, jid: int) -> MissExplanation:
             name = seg.detail.split(":", 1)[1]
             interrupts[name] = interrupts.get(name, 0) + n
         elif seg.kind == "idle":
-            cats["idle"] += n
-            add_mode_time(seg.mode or "default", "idle", n)
+            if _is_deferred_during(sys, job, lo, hi):
+                cats["conceded"] += n
+                add_mode_time(seg.mode or "default", "conceded", n)
+            else:
+                cats["idle"] += n
+                add_mode_time(seg.mode or "default", "idle", n)
         elif seg.jid is not None:
             other = _find_job(sys, seg.jid)
-            if other.base_priority >= job.base_priority:
+            # 本作业正处于因关键程度升级而被延后的状态
+            if _is_deferred_during(sys, job, lo, hi):
+                cats["conceded"] += n
+                add_mode_time(seg.mode or "default", "conceded", n)
+            elif other.base_priority >= job.base_priority:
                 cats["preempted"] += n
                 add_mode_time(seg.mode or "default", "preempted", n)
                 preemptions[other.task.name] = (
@@ -182,6 +216,11 @@ def _build_lines(job, window, cats, preemptions, inversions,
         lines.append(
             "- 优先级反转/阻塞 %d 拍（低优先级任务：%s）"
             % (cats["inversion"], detail)
+        )
+    if cats["conceded"]:
+        lines.append(
+            "- 因关键程度临时升级按让步策略被推迟 %d 拍"
+            % cats["conceded"]
         )
     if cats["idle"]:
         lines.append("- 空转 %d 拍" % cats["idle"])

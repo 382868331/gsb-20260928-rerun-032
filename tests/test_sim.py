@@ -12,6 +12,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from embsim import (
+    CriticalityCommitment,
     Costs,
     InterruptSource,
     ModeSpec,
@@ -495,7 +496,7 @@ class TestModeLockBudgetAndInheritance(unittest.TestCase):
         sys_ = self.build()
         sys_.run_until(1)
         sys_.switch_mode("B", "immediate")
-        sys_.run_until(3)
+        sys_.run_until(4)
 
         low, high = sys_.jobs
         self.assertEqual(low.held, ["R"])
@@ -571,6 +572,274 @@ class TestModeSnapshot(unittest.TestCase):
             [(e.time, e.mode, e.strategy, e.target_jid)
              for e in reopened.mode_events],
         )
+
+
+class TestCriticalityEscalation(unittest.TestCase):
+    """临时提高关键程度 + 让步策略。
+
+    L(优先级1)：lock R, run3, unlock R, run2（临界区后还有可暂停工作）
+    M(优先级2)：run4
+    H(优先级3)：run1, lock R, run1, unlock R（offset=4）
+    开销：切换 0、lock/unlock 各 1。
+    t=4 升级 H 到关键级别 5（defer 策略），t=12 撤回。
+    """
+
+    def build(self):
+        return System(
+            tasks=[
+                TaskSpec("L", 1,
+                         [lock("R"), run(3), unlock("R"), run(2)],
+                         period=100),
+                TaskSpec("M", 2, [run(4)], period=100, offset=1),
+                TaskSpec("H", 3,
+                         [run(1), lock("R"), run(1), unlock("R")],
+                         period=100, offset=4, deadline=30),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+        )
+
+    def test_defer_preserves_work_and_resources(self):
+        sys_ = self.build()
+        sys_.escalate(
+            CriticalityCommitment("c1", "H", priority=5,
+                                  deadline=8, strategy="defer"),
+            at_time=4,
+        )
+        sys_.run_until(9)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        # M 已执行 3 拍（[1,4)），被延后时进度不清零
+        m_job = jobs["M"]
+        self.assertEqual(m_job.state, "deferred")
+        self.assertEqual(m_job.deferred_by, "c1")
+        self.assertEqual(m_job.remaining_work(), 1)
+        # L 仍持有 R：持锁临界区部分必须继续，不能因让步卡死锁
+        self.assertEqual(jobs["L"].held, ["R"])
+        self.assertEqual(jobs["L"].state, "running")
+        # L 借到升级后 H 的关键级别（继承压力来自承诺级别 5）
+        self.assertEqual(sys_._job_crit_level(jobs["L"]), 5)
+
+        sys_.withdraw("c1", at_time=12)
+        sys_.run_until(13)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        self.assertEqual(jobs["M"].state, "ready")
+        self.assertIsNone(jobs["M"].deferred_by)
+        # 让步明细：M 从 4 推迟到 12；L 临界区后剩余工作 9->12
+        timeline = sys_.concession_timeline()
+        self.assertEqual(
+            [(e.time, e.task, e.resumed_at)
+             for e in timeline],
+            [(4, "L", 5), (4, "M", 12), (9, "L", 12)],
+        )
+        self.assertIn("锁", timeline[0].resume_reason)
+        # M 延后期间已消耗的 3 拍没有消失：[13,14) 补完最后 1 拍
+        sys_.run_until(14)
+        m_job = next(j for j in sys_.jobs if j.task.name == "M")
+        self.assertEqual(m_job.completed_at, 14)
+
+    def test_lock_holder_runs_critical_section_then_defers_rest(self):
+        sys_ = self.build()
+        sys_.escalate(
+            CriticalityCommitment("c1", "H", priority=5,
+                                  strategy="defer"),
+            at_time=4,
+        )
+        sys_.run_until(12)
+        # 时间轴：临界区 run3 在 [6,9) 连续跑完并放锁 [9,10)，
+        # H 获得锁跑完；L 放锁后的 run2 被推迟，[10,12) 不属于 L
+        kinds = [(s.start, s.end, s.kind, s.detail)
+                 for s in sys_.trace
+                 if s.kind in ("task", "lock", "unlock")]
+        self.assertIn((6, 9, "task", "L#0"), kinds)
+        self.assertIn((9, 10, "unlock", "L#0 unlock R"), kinds)
+        self.assertIn((11, 12, "task", "H#2"), kinds)
+        l_job = next(j for j in sys_.jobs if j.task.name == "L")
+        self.assertEqual(l_job.state, "deferred")
+        # pc 已越过 unlock，剩余正好是临界区后的 2 拍
+        self.assertEqual(l_job.pc, 3)
+        self.assertEqual(l_job.remaining_work(), 2)
+        self.assertEqual(l_job.held, [])
+
+    def test_inherit_only_never_defers(self):
+        sys_ = self.build()
+        sys_.escalate(
+            CriticalityCommitment("c1", "H", priority=5,
+                                  strategy="inherit_only"),
+            at_time=4,
+        )
+        sys_.run_until(16)
+        self.assertFalse(
+            any(j.state == "deferred" for j in sys_.jobs)
+        )
+        self.assertEqual(sys_.concession_events, [])
+
+    def test_compare_strategies_shows_different_delay(self):
+        sys_ = self.build()
+        sys_.run_until(4)
+        results = sys_.compare_concessions(
+            CriticalityCommitment("c1", "H", priority=5,
+                                  deadline=20, strategy="defer"),
+            horizon=16,
+        )
+        self.assertEqual(results["inherit_only"]["concessions"], [])
+        deferred_tasks = {
+            c["task"] for c in results["defer"]["concessions"]
+        }
+        self.assertEqual(deferred_tasks, {"L", "M"})
+        # 比较不改变原系统状态
+        self.assertEqual(sys_.now, 4)
+
+    def test_escalation_tightens_only_newly_released_jobs(self):
+        sys_ = System(
+            tasks=[TaskSpec("H", 3, [run(2)], period=10,
+                            deadline=100)],
+            costs=Costs(context_switch=0),
+        )
+        sys_.run_until(2)  # 第一个作业已释放，截止 100
+        sys_.escalate(
+            CriticalityCommitment("c1", "H", priority=5,
+                                  deadline=3, strategy="defer")
+        )
+        sys_.run_until(11)
+        first, second = sys_.jobs
+        # 已释放作业的承诺不改：截止仍是 100
+        self.assertEqual(first.abs_deadline, 100)
+        self.assertIsNone(first.release_commitment)
+        # 升级期间新释放的作业（t=10）采用更紧的相对截止
+        self.assertEqual(second.release, 10)
+        self.assertEqual(second.abs_deadline, 13)
+        self.assertEqual(second.rel_deadline, 3)
+        self.assertEqual(second.release_commitment, "c1")
+
+    def test_consecutive_escalations_and_withdrawals_keep_order(self):
+        sys_ = System(
+            tasks=[TaskSpec("A", 1, [run(10)], period=100),
+                   TaskSpec("B", 2, [run(10)], period=100)],
+            costs=Costs(context_switch=0),
+        )
+        # 同一拍提出：升级 A、撤回 A、再升级 A——按提出先后生效
+        sys_.escalate(CriticalityCommitment("c", "A", priority=5),
+                      at_time=2)
+        sys_.withdraw("c", at_time=2)
+        sys_.escalate(CriticalityCommitment("c", "A", priority=5),
+                      at_time=2)
+        sys_.run_until(3)
+        self.assertEqual(
+            [(e.time, e.seq, e.kind) for e in sys_.commitment_events],
+            [(2, 0, "escalate"), (2, 1, "withdraw"),
+             (2, 2, "escalate")],
+        )
+        self.assertIn("c", sys_.active_commitments)
+
+    def test_mode_switch_and_escalation_coexist(self):
+        sys_ = System(
+            tasks=[TaskSpec("T", 1, [run(4)], period=10)],
+            costs=Costs(context_switch=0),
+            modes=[ModeSpec("A"), ModeSpec("B")],
+            initial_mode="A",
+        )
+        sys_.switch_mode("B", "immediate", at_time=2)
+        sys_.escalate(
+            CriticalityCommitment("c", "T", priority=4), at_time=2
+        )
+        sys_.run_until(3)
+        self.assertEqual(sys_.mode, "B")
+        self.assertIn("c", sys_.active_commitments)
+        self.assertEqual(
+            [(e.time, e.mode) for e in sys_.mode_events],
+            [(0, "A"), (2, "B")],
+        )
+
+    def test_snapshot_resume_same_timeline_with_commitments(self):
+        def build():
+            s = self.build()
+            s.escalate(
+                CriticalityCommitment("c1", "H", priority=5,
+                                      deadline=20, strategy="defer"),
+                at_time=4,
+            )
+            s.withdraw("c1", at_time=12)
+            return s
+
+        whole = build()
+        whole.run_until(20)
+        part = build()
+        part.run_until(9)
+        reopened = System.restore(part.snapshot())
+        reopened.run_until(20)
+        self.assertEqual(segs(whole), segs(reopened))
+        self.assertEqual(
+            [(e.time, e.seq, e.kind, e.name)
+             for e in whole.commitment_events],
+            [(e.time, e.seq, e.kind, e.name)
+             for e in reopened.commitment_events],
+        )
+        self.assertEqual(
+            [(c.time, c.task, c.jid, c.resumed_at)
+             for c in whole.concession_events],
+            [(c.time, c.task, c.jid, c.resumed_at)
+             for c in reopened.concession_events],
+        )
+
+    def test_prior_miss_not_rewritten_by_later_escalation(self):
+        sys_ = System(
+            tasks=[TaskSpec("T", 1, [run(5)], period=10, deadline=3)],
+            costs=Costs(context_switch=0),
+        )
+        sys_.run_until(4)  # t=3 截止瞬间还差 2 拍
+        sys_.escalate(
+            CriticalityCommitment("c", "T", priority=5, deadline=100)
+        )
+        sys_.run_until(8)
+        miss = sys_.misses[0]
+        self.assertEqual(miss.remaining_work, 2)
+        ex = explain_miss(sys_, miss.jid)
+        self.assertEqual(ex.remaining_work, 2)
+        self.assertTrue(ex.work_consistent)
+
+    def test_explain_attributes_deferred_ticks_as_concession(self):
+        sys_ = System(
+            tasks=[
+                TaskSpec("L", 1,
+                         [lock("R"), run(3), unlock("R"), run(2)],
+                         period=100),
+                TaskSpec("M", 2, [run(4)], period=100, offset=1,
+                         deadline=7),
+                TaskSpec("H", 3,
+                         [run(1), lock("R"), run(1), unlock("R")],
+                         period=100, offset=4, deadline=30),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+        )
+        # M 截止 8，升级在 4 生效后 M 被延后；超期归因应含让步拍
+        sys_.escalate(
+            CriticalityCommitment("c1", "H", priority=5,
+                                  strategy="defer"),
+            at_time=4,
+        )
+        sys_.run_until(12)
+        m_job = next(j for j in sys_.jobs if j.task.name == "M")
+        self.assertTrue(m_job.missed)
+        ex = explain_miss(sys_, m_job.jid)
+        # 窗口 [1,8)：已执行 [1,4) 3 拍；[4,8) 处于 deferred 态
+        self.assertEqual(ex.categories["self_run"], 3)
+        self.assertEqual(ex.categories["conceded"], 4)
+        self.assertTrue(ex.consistent)
+        self.assertIn("让步策略被推迟", ex.report())
+
+    def test_pending_deferrals_explained(self):
+        sys_ = self.build()
+        sys_.escalate(
+            CriticalityCommitment("c1", "H", priority=5,
+                                  strategy="defer"),
+            at_time=4,
+        )
+        sys_.run_until(11)
+        pending = sys_.pending_deferrals()
+        tasks = {p["task"]: p for p in pending}
+        self.assertEqual(set(tasks), {"L", "M"})
+        self.assertEqual(tasks["M"]["remaining_work"], 1)
+        self.assertEqual(tasks["L"]["commitment"], "c1")
+        self.assertIsNotNone(tasks["L"]["deferred_at"])
 
 
 if __name__ == "__main__":

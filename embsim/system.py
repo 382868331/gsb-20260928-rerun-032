@@ -20,7 +20,13 @@ import pickle
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from .model import Costs, InterruptSource, ModeSpec, TaskSpec
+from .model import (
+    Costs,
+    CriticalityCommitment,
+    InterruptSource,
+    ModeSpec,
+    TaskSpec,
+)
 
 
 # ---------------------------------------------------------------- 运行态
@@ -38,11 +44,13 @@ class Job:
     mode: str = "default"
     pc: int = 0                      # 当前程序步下标
     step_left: int = 0               # 当前 run 步剩余拍数
-    state: str = "ready"             # ready/running/blocked/done
+    state: str = "ready"             # ready/running/blocked/deferred/done
     held: List[str] = field(default_factory=list)
     blocked_on: Optional[str] = None
     lock_request_mode: Optional[str] = None
     boost: int = 0                   # 继承得到的优先级增量
+    deferred_by: Optional[str] = None  # 被哪条承诺延后（承诺名）
+    release_commitment: Optional[str] = None  # 释放时生效的升级承诺
     completed_at: Optional[int] = None
     missed: bool = False
     record: Dict = field(default_factory=dict)
@@ -88,6 +96,8 @@ class MissRecord:
     remaining_work: int
     release_mode: str = "default"
     deadline_mode: str = "default"
+    release_commitment: Optional[str] = None
+    deadline_commitments: tuple = ()
 
 
 @dataclass
@@ -113,6 +123,31 @@ class LockBudgetViolation:
     released_at: Optional[int] = None
 
 
+@dataclass
+class CommitmentEvent:
+    """升级/撤回在调度轴上的生效事件（保留先后关系）。"""
+
+    time: int
+    seq: int
+    kind: str                # escalate / withdraw
+    name: str                # 承诺名
+
+
+@dataclass
+class ConcessionEvent:
+    """某项作业因让步策略被推迟、以及后来恢复的记录。"""
+
+    time: int                # 开始被延后的时刻（拍边界）
+    jid: int
+    task: str
+    commitment: str          # 哪条承诺导致延后
+    commitment_task: str     # 被升级的是哪个任务
+    strategy: str
+    reason: str
+    resumed_at: Optional[int] = None
+    resume_reason: Optional[str] = None
+
+
 class System:
     def __init__(
         self,
@@ -122,6 +157,7 @@ class System:
         use_inheritance: bool = True,
         modes: Optional[List[ModeSpec]] = None,
         initial_mode: Optional[str] = None,
+        commitments: Optional[List[CriticalityCommitment]] = None,
     ):
         self.tasks = {t.name: t for t in tasks}
         self.interrupts = interrupts or []
@@ -141,6 +177,21 @@ class System:
         self.pending_mode_change: Optional[ModeEvent] = None
         self.lock_budget_violations: List[LockBudgetViolation] = []
 
+        # 关键程度承诺：规格表 + 当前生效表 + 调度轴上的生效事件
+        self.commitments: Dict[str, CriticalityCommitment] = {}
+        if commitments:
+            for c in commitments:
+                if c.name in self.commitments:
+                    raise ValueError("duplicate commitment name: %r" % c.name)
+                if c.task not in self.tasks:
+                    raise KeyError("unknown task in commitment: %r" % c.task)
+                self.commitments[c.name] = c
+        self.active_commitments: Dict[str, CriticalityCommitment] = {}
+        self.pending_commitment_events: List[CommitmentEvent] = []
+        self.commitment_events: List[CommitmentEvent] = []
+        self.concession_events: List[ConcessionEvent] = []
+        self._next_commitment_seq = 0
+
         self.now = 0
         self.jobs: List[Job] = []
         self._next_jid = 0
@@ -157,6 +208,71 @@ class System:
         )
         self.trace: List[Segment] = []
         self.misses: List[MissRecord] = []
+
+    # ------------------------------------------------------------ 承诺升级/撤回
+
+    def escalate(
+        self,
+        commitment: CriticalityCommitment,
+        at_time: Optional[int] = None,
+    ):
+        """提出一项关键程度升级；可在 at_time 指定的拍边界生效。
+
+        已经登记过同名承诺时沿用原规格（再次提出只重排生效顺序）；
+        撤回与升级按提出先后排队，同一承诺可反复升级、撤回。
+        请求本身不占 CPU，不回滚任何已占有资源或已消耗执行时间。
+        """
+        if commitment.task not in self.tasks:
+            raise KeyError("unknown task in commitment: %r" % commitment.task)
+        if at_time is not None and at_time < self.now:
+            raise ValueError("escalation time cannot be in the past")
+        self.commitments.setdefault(commitment.name, commitment)
+        self._queue_commitment_event(
+            "escalate", commitment.name,
+            self.now if at_time is None else at_time,
+        )
+
+    def withdraw(self, name: str, at_time: Optional[int] = None):
+        """撤回一项承诺；撤回到点后被它延后的作业按顺序恢复。"""
+        if name not in self.commitments:
+            raise KeyError("unknown commitment: %r" % name)
+        if at_time is not None and at_time < self.now:
+            raise ValueError("withdrawal time cannot be in the past")
+        self._queue_commitment_event(
+            "withdraw", name,
+            self.now if at_time is None else at_time,
+        )
+
+    def _queue_commitment_event(self, kind: str, name: str, time: int):
+        event = CommitmentEvent(
+            time=time,
+            seq=self._next_commitment_seq,
+            kind=kind,
+            name=name,
+        )
+        self._next_commitment_seq += 1
+        self.pending_commitment_events.append(event)
+        self.pending_commitment_events.sort(key=lambda e: (e.time, e.seq))
+
+    def _apply_due_commitment_events(self):
+        due = [e for e in self.pending_commitment_events if e.time <= self.now]
+        if not due:
+            return
+        remaining = [e for e in self.pending_commitment_events
+                     if e.time > self.now]
+        due.sort(key=lambda e: (e.time, e.seq))
+        self.pending_commitment_events = remaining
+        for event in due:
+            spec = self.commitments[event.name]
+            if event.kind == "escalate":
+                self.active_commitments[event.name] = spec
+            else:
+                self.active_commitments.pop(event.name, None)
+            self.commitment_events.append(event)
+        # 升级/撤回改变等待者的关键级别，沿等待链的继承压力需重算
+        self._recompute_boosts()
+        # 承诺集合变化后重新评估谁应当被让步
+        self._recompute_deferrals()
 
     def _mode_spec(self, mode_name: Optional[str] = None) -> Optional[ModeSpec]:
         return self.modes.get(mode_name or self.mode)
@@ -187,6 +303,13 @@ class System:
                 period = self._task_period(t.name, t.period)
                 rel_deadline = self._task_rel_deadline(t.name, t)
                 release_mode = self.mode
+                # 生效中的升级承诺可以收紧新作业的相对响应要求；
+                # 已释放作业的绝对截止承诺冻结在 Job 里，事后不改。
+                release_commitment = None
+                for c in self.active_commitments.values():
+                    if c.task == t.name and c.deadline is not None:
+                        rel_deadline = min(rel_deadline, c.deadline)
+                        release_commitment = c.name
                 self._next_release[t.name] += period
                 job = Job(
                     jid=self._next_jid,
@@ -196,11 +319,13 @@ class System:
                     period=period,
                     rel_deadline=rel_deadline,
                     mode=release_mode,
+                    release_commitment=release_commitment,
                 )
                 if t.program and t.program[0].kind == "run":
                     job.step_left = t.program[0].arg
                 self._next_jid += 1
                 self.jobs.append(job)
+                self._recompute_deferrals()
         while self._irq_schedule and self._irq_schedule[0][0] <= self.now:
             _, _, src = self._irq_schedule.pop(0)
             self._irq_pending.append({"src": src, "left": src.total_cost})
@@ -219,13 +344,176 @@ class System:
                 for res_name in job.held:
                     res = self.resources[res_name]
                     for w in res["waiters"]:
-                        want = max(want, w.eff_priority - job.base_priority)
+                        want = max(want, self._job_crit_level(w)
+                                  - job.base_priority)
                 want = max(0, want)
                 if want != job.boost:
                     job.boost = want
                     changed = True
             if not changed:
                 break
+
+    # ------------------------------------------------------------ 关键程度与让步
+
+    def _job_commitments(self, job: Job) -> List[CriticalityCommitment]:
+        """当前对该作业生效的升级承诺（同一任务可能被多条承诺升级）。"""
+        return [c for c in self.active_commitments.values()
+                if c.task == job.task.name and job.state != "done"]
+
+    def _job_crit_level(self, job: Optional[Job]) -> int:
+        """作业的关键级别：静态优先级之上叠加有效承诺。
+
+        阻塞在锁上的已升级作业同样沿等待链施压（见 _protected_holders）。
+        """
+        if job is None:
+            return -10**18
+        level = job.eff_priority
+        for c in self._job_commitments(job):
+            if c.priority is not None:
+                level = max(level, c.priority)
+        return level
+
+    def _protected_holders(self) -> set:
+        """因已升级作业等锁而必须继续完成临界区的持有者集合。
+
+        沿“等待者 -> 持有者”关系传播（含传递等待）：被升级的等待者
+        施压时，整条持锁链上的持有者都不能被让步延后，否则锁永远
+        无法释放。链上的非持锁计算部分（放锁之后的 run）仍可延后。
+        """
+        protected = set()  # 内容为作业 jid
+        # 初始施压者：任何非延后且正在等锁的作业；已升级等待者的关键
+        # 级别同样沿继承传播，保证它等待的锁一定能被持有者放出。
+        stack = [
+            j for j in self.jobs
+            if j.state not in ("done", "deferred")
+            and j.blocked_on is not None
+        ]
+        seen = set()
+        while stack:
+            waiter = stack.pop()
+            if waiter.jid in seen:
+                continue
+            seen.add(waiter.jid)
+            for res_name, res in self.resources.items():
+                holder = res["holder"]
+                if holder is None or holder.jid in protected:
+                    continue
+                if waiter is holder or waiter not in res["waiters"]:
+                    continue
+                protected.add(holder.jid)
+                # 持有者若自己也在等别的锁，则压力继续向上游传播
+                if holder.blocked_on is not None:
+                    stack.append(holder)
+        return protected
+
+    def _recompute_deferrals(self):
+        """依据当前生效承诺重新决定每个作业的延后/恢复。
+
+        - inherit_only 策略从不主动延后任何作业；
+        - defer 策略把关键级别严格低于最高已升级级别、且不持锁处于
+          等待链上的就绪/运行作业延后；持锁链上的持有者豁免，先把锁放出；
+        - 承诺撤回后不再满足延后条件的作业立即恢复就绪。
+        延后不清空 pc/step_left/held：已占有资源与已执行时间原样保留。
+        """
+        active = list(self.active_commitments.values())
+        deferring = [c for c in active if c.strategy == "defer"]
+        if not deferring:
+            for job in self.jobs:
+                if job.state == "deferred":
+                    self._resume_job(job, "承诺撤回，让步结束")
+            return
+
+        top_level = max(
+            (c.priority for c in deferring if c.priority is not None),
+            default=None,
+        )
+        protected = self._protected_holders()
+        for job in self.jobs:
+            if job.state in ("done", "blocked"):
+                continue
+            commitment = self._deferring_commitment_for(job, deferring,
+                                                        top_level)
+            if commitment is not None and job.jid not in protected:
+                self._defer_job(job, commitment, protected)
+            elif job.state == "deferred" and (
+                    job.jid in protected or commitment is None):
+                reason = (
+                    "作业持有升级任务正在等待的锁，先完成临界区放锁"
+                    if job.jid in protected else "承诺撤回或关键级别不再占优"
+                )
+                self._resume_job(job, reason)
+
+    def _deferring_commitment_for(self, job, deferring, top_level):
+        """返回要求该作业让步的承诺（取提出最早者），无则 None。"""
+        candidates = []
+        job_level = self._job_crit_level(job)
+        for c in deferring:
+            # 被升级任务自身、以及同级或更高关键作业不被延后
+            if c.task == job.task.name:
+                continue
+            if c.priority is not None and job_level >= c.priority:
+                continue
+            if top_level is not None and job_level >= top_level:
+                continue
+            candidates.append(c)
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda c: next(
+                (e.seq for e in self.commitment_events[::-1]
+                 if e.kind == "escalate" and e.name == c.name),
+                10**18,
+            )
+        )
+        return candidates[0]
+
+    def _defer_job(self, job: Job, commitment: CriticalityCommitment,
+                   protected: set):
+        if job.state == "deferred" and job.deferred_by == commitment.name:
+            return
+        if job.state == "deferred":
+            return
+        if self.current is job and job.state == "running":
+            job.state = "ready"
+            self.current = None
+        reason = (
+            "关键级别 %d 低于升级任务 %s 的承诺级别 %d，按 %s 策略延后；"
+            "已执行进度与已占有资源保留"
+            % (
+                job.base_priority,
+                commitment.task,
+                commitment.priority,
+                commitment.strategy,
+            )
+        )
+        job.state = "deferred"
+        job.deferred_by = commitment.name
+        # 若正在切换到该作业的路上，取消目标（已付的切换开销留在时间线上）
+        if self._switch_to is job:
+            self._switch_to = None
+            self._switch_left = 0
+        self.concession_events.append(ConcessionEvent(
+            time=self.now,
+            jid=job.jid,
+            task=job.task.name,
+            commitment=commitment.name,
+            commitment_task=commitment.task,
+            strategy=commitment.strategy,
+            reason=reason,
+        ))
+
+    def _resume_job(self, job: Job, reason: str):
+        commitment_name = job.deferred_by
+        event = next(
+            (e for e in reversed(self.concession_events)
+             if e.jid == job.jid and e.resumed_at is None),
+            None,
+        )
+        if event is not None:
+            event.resumed_at = self.now
+            event.resume_reason = reason
+        job.state = "ready"
+        job.deferred_by = None
 
     # ------------------------------------------------------------ 资源操作
 
@@ -266,6 +554,7 @@ class System:
             if self.current is job:
                 self.current = None
         self._recompute_boosts()
+        self._recompute_deferrals()
 
     def _do_unlock(self, job: Job, res_name: str):
         res = self.resources[res_name]
@@ -280,12 +569,18 @@ class System:
             # 等待者回到就绪态，被调度到时重新执行 lock 系统调用竞争锁；
             # 未抢到者再次阻塞，其继承压力随之重新挂到新持有者上。
             for w in list(res["waiters"]):
-                w.state = "ready"
+                if w.state == "deferred":
+                    pass  # 仍处于让步延后：不参与本次抢锁
+                else:
+                    w.state = "ready"
                 w.blocked_on = None
             res["waiters"].clear()
         job.pc += 1
         self._prime_step(job)
         self._recompute_boosts()
+        # 放锁后等待链改变：原本被豁免的持有者可能变成可延后作业，
+        # 原本延后的等待者若仍被承诺覆盖则继续延后（状态在重算中统一裁决）
+        self._recompute_deferrals()
 
     def _check_lock_budgets(self, at_time: Optional[int] = None):
         at_time = self.now if at_time is None else at_time
@@ -333,13 +628,17 @@ class System:
     # ------------------------------------------------------------ 选择
 
     def _ready_jobs(self) -> List[Job]:
-        return [j for j in self.jobs if j.state in ("ready", "running")]
+        # deferred 作业的资源与执行进度仍保留，但不参与调度
+        return [j for j in self.jobs
+                if j.state in ("ready", "running")]
 
     def _select(self) -> Optional[Job]:
         ready = self._ready_jobs()
         if not ready:
             return None
-        return max(ready, key=lambda j: (j.eff_priority, -j.jid))
+        # 选择键先看关键级别（静态优先级 + 继承 + 生效承诺），
+        # 同级别按作业号（FIFO，保证调度轴确定）
+        return max(ready, key=lambda j: (self._job_crit_level(j), -j.jid))
 
     # ------------------------------------------------------------ 模式切换
 
@@ -426,6 +725,7 @@ class System:
     def step(self):
         """推进一拍（切换决策本身不耗拍，切换开销在后续拍计入）。"""
         self._apply_due_mode_change()
+        self._apply_due_commitment_events()
         self._release_due()
 
         if self._irq_pending:
@@ -505,6 +805,9 @@ class System:
     def _finish_tick(self):
         self.now += 1
         self._apply_due_mode_change(self.now)
+        # 拍边界：预排到此刻的升级/撤回在同一边界生效，
+        # 与模式切换的先后按各自请求顺序独立保留（互不改写历史）
+        self._apply_due_commitment_events()
         for job in self.jobs:
             if (not job.missed and job.state != "done"
                     and self.now >= job.abs_deadline):
@@ -517,6 +820,8 @@ class System:
                     remaining_work=job.remaining_work(),
                     release_mode=job.mode,
                     deadline_mode=self.mode,
+                    release_commitment=job.release_commitment,
+                    deadline_commitments=tuple(sorted(self.active_commitments)),
                 ))
 
     @staticmethod
@@ -533,6 +838,87 @@ class System:
             guard += 1
             if guard > 10 ** 7:
                 raise RuntimeError("仿真未收敛，疑似死循环")
+
+    # ------------------------------------------------------------ 让步查询
+
+    def concession_timeline(self) -> List[ConcessionEvent]:
+        """逐项返回谁被推迟、何时恢复及原因（按生效先后）。"""
+        return list(self.concession_events)
+
+    def pending_deferrals(self) -> List[Dict]:
+        """截至当前时刻仍未恢复的被延后作业，附承诺与原因说明。"""
+        result = []
+        for job in self.jobs:
+            if job.state != "deferred":
+                continue
+            spec = self.commitments.get(job.deferred_by)
+            event = next(
+                (e for e in reversed(self.concession_events)
+                 if e.jid == job.jid and e.resumed_at is None),
+                None,
+            )
+            result.append({
+                "jid": job.jid,
+                "task": job.task.name,
+                "deferred_at": event.time if event else None,
+                "commitment": job.deferred_by,
+                "commitment_task": spec.task if spec else None,
+                "strategy": spec.strategy if spec else None,
+                "reason": event.reason if event else None,
+                "remaining_work": job.remaining_work(),
+                "held_resources": list(job.held),
+            })
+        return result
+
+    def compare_concessions(
+        self,
+        commitment: CriticalityCommitment,
+        horizon: int,
+    ) -> Dict[str, Dict]:
+        """同一升级分别用两种让步策略各跑一份副本，便于用户比较。
+
+        返回 {"inherit_only": {...}, "defer": {...}}，每项汇总完成时刻、
+        超期情况与推迟/恢复明细；副本不影响当前系统。
+        """
+        results = {}
+        for strategy in ("inherit_only", "defer"):
+            clone = System.restore(self.snapshot())
+            spec = CriticalityCommitment(
+                name=commitment.name,
+                task=commitment.task,
+                priority=commitment.priority,
+                deadline=commitment.deadline,
+                strategy=strategy,
+            )
+            clone.commitments.pop(commitment.name, None)
+            clone.escalate(spec)
+            clone.run_until(horizon)
+            results[strategy] = {
+                "misses": [
+                    {
+                        "jid": m.jid, "task": m.task,
+                        "deadline": m.deadline,
+                        "remaining_work": m.remaining_work,
+                    }
+                    for m in clone.misses
+                ],
+                "completed": {
+                    j.task.name: j.completed_at
+                    for j in clone.jobs if j.completed_at is not None
+                },
+                "concessions": [
+                    {
+                        "time": e.time, "task": e.task,
+                        "resumed_at": e.resumed_at,
+                        "reason": e.reason,
+                        "resume_reason": e.resume_reason,
+                    }
+                    for e in clone.concession_events
+                ],
+                "still_deferred": clone.pending_deferrals(),
+                "system": clone,
+            }
+        return results
 
     # ------------------------------------------------------------ 快照
 

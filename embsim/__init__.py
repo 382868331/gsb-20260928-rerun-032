@@ -5,6 +5,7 @@
 """
 
 from .model import (
+    CriticalityCommitment,
     Costs,
     InterruptSource,
     ModeSpec,
@@ -14,11 +15,19 @@ from .model import (
     run,
     unlock,
 )
-from .system import Job, MissRecord, Segment, System
+from .system import (
+    CommitmentEvent,
+    ConcessionEvent,
+    Job,
+    MissRecord,
+    Segment,
+    System,
+)
 from .explain import MissExplanation, explain_miss
 
 __all__ = [
     "Costs",
+    "CriticalityCommitment",
     "InterruptSource",
     "ModeSpec",
     "Step",
@@ -27,6 +36,8 @@ __all__ = [
     "run",
     "unlock",
     "Job",
+    "CommitmentEvent",
+    "ConcessionEvent",
     "MissRecord",
     "Segment",
     "System",

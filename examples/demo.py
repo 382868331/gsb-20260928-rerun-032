@@ -6,7 +6,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from embsim import Costs, InterruptSource, System, TaskSpec, explain_miss
+from embsim import (Costs, CriticalityCommitment, InterruptSource, System,
+                    TaskSpec, explain_miss)
 from embsim import lock, run, unlock
 
 
@@ -73,3 +74,47 @@ chain.run_until(25)
 j = {x.task.name: x for x in chain.jobs}
 print("解除后恢复：M boost =", j["M"].boost, "，H 完成于",
       j["H"].completed_at)
+
+print()
+print("=== 临时升级 H 的关键程度：低关键任务让步，持锁部分继续放锁 ===")
+esc = System(
+    tasks=[
+        TaskSpec("L", 1,
+                 [lock("R"), run(3), unlock("R"), run(2)], period=100),
+        TaskSpec("M", 2, [run(4)], period=100, offset=1, deadline=7),
+        TaskSpec("H", 3,
+                 [run(1), lock("R"), run(1), unlock("R")],
+                 period=100, offset=4),
+    ],
+    costs=Costs(context_switch=0, lock=1, unlock=1),
+)
+esc.escalate(CriticalityCommitment("hot", "H", priority=5,
+                                   deadline=8, strategy="defer"),
+             at_time=4)
+esc.withdraw("hot", at_time=12)
+esc.run_until(14)
+for c in esc.concession_timeline():
+    print("  %s# 推迟@%d -> 恢复@%s：%s（%s）"
+          % (c.task, c.time, c.resumed_at, c.reason, c.resume_reason))
+m_job = next(j for j in esc.jobs if j.task.name == "M")
+if m_job.missed:
+    print()
+    print(explain_miss(esc, m_job.jid).report())
+
+print()
+print("=== 两种让步策略对比 ===")
+base = System(
+    tasks=[
+        TaskSpec("L", 1, [run(4)], period=100),
+        TaskSpec("H", 3, [run(2)], period=100, offset=2),
+    ],
+    costs=Costs(context_switch=0),
+)
+base.run_until(2)
+cmp = base.compare_concessions(
+    CriticalityCommitment("hot", "H", priority=5), horizon=8
+)
+for name, r in cmp.items():
+    print("  %-12s 让步项=%d 完成时刻=%s 超期=%d"
+          % (name, len(r["concessions"]), r["completed"],
+             len(r["misses"])))
