@@ -87,3 +87,34 @@ priority inheritance）：任务阻塞在资源上时，持有者优先级立即
 - `embsim/explain.py` — 错过截止时间的归因解释
 - `tests/test_sim.py` — 手算核对的小例子（`python3 -m unittest discover -s tests`）
 - `examples/demo.py` — 端到端演示
+## 运行期关键程度升级
+
+`sys.escalate(task, priority_raise, response=..., strategy=..., ...)`
+让某项工作到达指定事件后临时提高关键程度，触发事件三选一：
+
+- `at_time=t`：到达指定拍边界；
+- `on_lock=R`：目标任务获得资源 R；
+- `on_step=k`：目标任务程序计数到达第 k 步。
+
+触发后目标作业获得 `priority_raise` 的优先级增量；给出 `response` 时
+其绝对截止被临时收紧为 `applied_at + response`（不晚于释放时的承诺，
+原承诺在撤回后恢复）。让步策略可对比：
+
+- `strategy="priority"`：只抬优先级，不推迟任何任务；
+- `strategy="defer"`：有效优先级低于升级目标的作业被推迟，但**持有
+  资源的作业必须先完成临界区**——已占有的锁与已消耗的执行时间不会
+  凭空消失，放锁后的可暂停工作才被让步，因此让步永远不会造成锁
+  无法释放。
+
+`sys.revoke(eid)` 撤回升级；目标作业完成时升级自动结束。多个升级
+接连提出、升级又撤回、与模式切换同时发生时，每项承诺的生效范围与
+先后关系都保留在 `sys.escalations`（state / applied_at / ended_at /
+end_reason）中，可逐项回放。被推迟的作业逐项记录在 `sys.deferrals`
+（何时被推迟、何时恢复、原因），`explain_deferrals(sys)` 输出中文
+报告；尚未恢复的作业明确标注“至今未恢复”及其原因。
+
+错过截止的归因随之扩展：`explain_miss()` 增加“被让步推迟”类别
+（按升级编号细分），各项之和仍恒等于窗口长度；窗口与剩余工作量
+一律取自截止瞬间冻结的 `MissRecord`，既成超期事实不会被后来的
+升级或撤回改写。升级/让步状态完整进入快照，断点续跑与一次跑完的
+执行记录逐段一致。

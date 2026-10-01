@@ -17,6 +17,7 @@ from embsim import (
     ModeSpec,
     System,
     TaskSpec,
+    explain_deferrals,
     explain_miss,
     lock,
     run,
@@ -575,3 +576,266 @@ class TestModeSnapshot(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestEscalation(unittest.TestCase):
+    """关键程度临时升级：触发、让步、恢复、撤回。
+
+    场景A（defer 让步）：L(优先级1,wcet6) 与 K(优先级2,offset4,wcet2)，
+    K 在 t=0 请求升级（+5）。K 的作业 t=4 才释放，升级在 t=5 边界生效。
+    手算：switch[0,1) L[1,4) switch[4,5) K[5,7) switch[7,8) L[8,11)
+    L 在 [5,7) 被让步推迟，K 完成（升级结束）后于 t=7 恢复。
+    """
+
+    @staticmethod
+    def build_a(strategy="defer"):
+        sys_ = System(
+            tasks=[
+                TaskSpec("L", 1, [run(6)], period=100),
+                TaskSpec("K", 2, [run(2)], period=100, offset=4),
+            ],
+            costs=COSTS,
+        )
+        sys_.escalate("K", 5, strategy=strategy, at_time=0)
+        return sys_
+
+    def test_defer_timeline(self):
+        sys_ = self.build_a()
+        sys_.run_until(12)
+        self.assertEqual(
+            segs(sys_),
+            [
+                (0, 1, "switch", "switch->L#0"),
+                (1, 4, "task", "L#0"),
+                (4, 5, "switch", "switch->K#1"),
+                (5, 7, "task", "K#1"),
+                (7, 8, "switch", "switch->L#0"),
+                (8, 11, "task", "L#0"),
+                (11, 12, "idle", "idle"),
+            ],
+        )
+        assert_contiguous(self, sys_, 12)
+
+    def test_deferral_record(self):
+        sys_ = self.build_a()
+        sys_.run_until(12)
+        self.assertEqual(len(sys_.deferrals), 1)
+        rec = sys_.deferrals[0]
+        self.assertEqual((rec.jid, rec.task, rec.deferred_at, rec.resumed_at),
+                         (0, "L", 5, 7))
+        self.assertIn("完成", rec.reason)
+        esc = sys_.escalations[0]
+        self.assertEqual((esc.state, esc.applied_at, esc.ended_at),
+                         ("done", 5, 7))
+        k = next(j for j in sys_.jobs if j.task.name == "K")
+        low = next(j for j in sys_.jobs if j.task.name == "L")
+        self.assertEqual(k.esc_boost, 0)
+        self.assertFalse(low.deferred)
+
+    def test_priority_strategy_defers_nobody(self):
+        """让步策略对比：priority 只抬优先级，不产生任何推迟记录。"""
+        sys_ = self.build_a(strategy="priority")
+        sys_.run_until(12)
+        self.assertEqual(sys_.deferrals, [])
+        self.assertEqual(explain_deferrals(sys_),
+                         ["没有任何任务被让步推迟。"])
+
+    def test_explain_deferrals_report(self):
+        sys_ = self.build_a()
+        sys_.run_until(12)
+        lines = explain_deferrals(sys_)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("L#0", lines[0])
+        self.assertIn("[5, 7)", lines[0])
+        self.assertIn("恢复", lines[0])
+
+    def test_unresumed_deferral_explained(self):
+        """升级一直生效时，被推迟作业必须标注“至今未恢复”及原因。"""
+        sys_ = System(
+            tasks=[
+                TaskSpec("L", 1, [run(4)], period=100),
+                TaskSpec("K", 2, [run(20)], period=100),
+            ],
+            costs=COSTS,
+        )
+        sys_.escalate("K", 5, strategy="defer", at_time=0)
+        sys_.run_until(8)
+        rec = sys_.deferrals[0]
+        self.assertIsNone(rec.resumed_at)
+        report = "\n".join(explain_deferrals(sys_))
+        self.assertIn("至今", report)
+        self.assertIn("仍未恢复", report)
+
+
+class TestEscalationWithLock(unittest.TestCase):
+    """升级任务等锁时：持有者的临界区不可暂停，放锁后才可让步。
+
+    L(优先级1): lock R, run2, unlock R, run2；K(优先级2,offset2):
+    run1, lock R, run1, unlock R。K 在 t=0 请求升级（+5, defer）。
+    手算：switch[0,1) L-lock[1,2) switch[2,3) K[3,4) K-lock[4,5)(阻塞)
+          switch[5,6) L[6,8) L-unlock[8,9)   <- L 持锁期间不被推迟
+          switch[9,10) K-lock[10,11) K[11,12) K-unlock[12,13)
+          switch[13,14) L[14,16)             <- L 放锁后才被推迟，K 完成后恢复
+    """
+
+    @staticmethod
+    def build():
+        sys_ = System(
+            tasks=[
+                TaskSpec("L", 1, [lock("R"), run(2), unlock("R"), run(2)],
+                         period=100),
+                TaskSpec("K", 2, [run(1), lock("R"), run(1), unlock("R")],
+                         period=100, offset=2),
+            ],
+            costs=COSTS,
+        )
+        sys_.escalate("K", 5, strategy="defer", at_time=0)
+        return sys_
+
+    def test_holder_finishes_critical_section(self):
+        sys_ = self.build()
+        sys_.run_until(20)
+        self.assertEqual(
+            segs(sys_),
+            [
+                (0, 1, "switch", "switch->L#0"),
+                (1, 2, "lock", "L#0 lock R"),
+                (2, 3, "switch", "switch->K#1"),
+                (3, 4, "task", "K#1"),
+                (4, 5, "lock", "K#1 lock R"),
+                (5, 6, "switch", "switch->L#0"),
+                (6, 8, "task", "L#0"),
+                (8, 9, "unlock", "L#0 unlock R"),
+                (9, 10, "switch", "switch->K#1"),
+                (10, 11, "lock", "K#1 lock R"),
+                (11, 12, "task", "K#1"),
+                (12, 13, "unlock", "K#1 unlock R"),
+                (13, 14, "switch", "switch->L#0"),
+                (14, 16, "task", "L#0"),
+                (16, 20, "idle", "idle"),
+            ],
+        )
+        done = {j.task.name: j.completed_at for j in sys_.jobs}
+        self.assertEqual(done["K"], 13)
+        self.assertEqual(done["L"], 16)
+        # L 持锁期间（[1,9)）从未被推迟；放锁后 [9,13) 才被让步
+        rec = sys_.deferrals[0]
+        self.assertEqual((rec.deferred_at, rec.resumed_at), (9, 13))
+        assert_contiguous(self, sys_, 20)
+
+    def test_snapshot_mid_escalation(self):
+        """升级生效中途保存，续跑与一次跑完逐段一致。"""
+        part = self.build()
+        part.run_until(9)
+        restored = System.restore(part.snapshot())
+        restored.run_until(20)
+        whole = self.build()
+        whole.run_until(20)
+        self.assertEqual(segs(restored), segs(whole))
+        key = lambda d: (d.jid, d.deferred_at, d.resumed_at, d.reason)
+        self.assertEqual([key(d) for d in restored.deferrals],
+                         [key(d) for d in whole.deferrals])
+
+
+class TestEscalationDeadlineAndRevoke(unittest.TestCase):
+    """response 收紧后续响应要求；撤回恢复原承诺，但既有超期事实冻结。
+
+    K(优先级2,wcet6,相对截止20)，t=0 请求升级（response=2）。
+    升级 t=1 生效，绝对截止收紧为 1+2=3；t=3 超期（已执行2拍，还差4拍）。
+    t=4 撤回，截止恢复 20；MissRecord 仍记录 deadline=3。
+    """
+
+    def test_tighten_miss_revoke(self):
+        sys_ = System(
+            tasks=[TaskSpec("K", 2, [run(6)], period=100, deadline=20)],
+            costs=COSTS,
+        )
+        eid = sys_.escalate("K", 3, response=2, strategy="priority",
+                            at_time=0)
+        sys_.run_until(4)
+        job = sys_.jobs[0]
+        self.assertEqual(len(sys_.misses), 1)
+        miss = sys_.misses[0]
+        self.assertEqual((miss.deadline, miss.remaining_work), (3, 4))
+        sys_.revoke(eid)
+        self.assertEqual(job.abs_deadline, 20)  # 撤回恢复原承诺
+        sys_.run_until(10)
+        self.assertEqual(job.completed_at, 7)
+        # 既有超期事实不被撤回改写
+        self.assertEqual(sys_.misses[0].deadline, 3)
+        exp = explain_miss(sys_, 0)
+        self.assertEqual(exp.deadline, 3)
+        self.assertEqual(exp.window, 3)
+        self.assertTrue(exp.consistent)
+        self.assertTrue(exp.work_consistent)
+        self.assertEqual(sys_.escalations[0].state, "revoked")
+        self.assertEqual(sys_.escalations[0].ended_at, 4)
+
+
+class TestEscalationExplainDeferred(unittest.TestCase):
+    """错过截止的归因包含“被让步推迟”类别，且各项之和恒等于窗口。
+
+    L(优先级1,wcet6,相对截止10) 被 K 的升级让步推迟 [5,7)，t=10 超期。
+    窗口 [0,10)：切换3拍 + 自身5拍 + 推迟2拍 = 10拍。
+    """
+
+    def test_deferred_category(self):
+        sys_ = System(
+            tasks=[
+                TaskSpec("L", 1, [run(6)], period=100, deadline=10),
+                TaskSpec("K", 2, [run(2)], period=100, offset=4),
+            ],
+            costs=COSTS,
+        )
+        sys_.escalate("K", 5, strategy="defer", at_time=0)
+        sys_.run_until(15)
+        exp = explain_miss(sys_, 0)
+        self.assertEqual(exp.categories["deferred"], 2)
+        self.assertEqual(exp.deferrals, {0: 2})
+        self.assertEqual(exp.categories["self_run"], 5)
+        self.assertEqual(exp.categories["context_switch"], 3)
+        self.assertTrue(exp.consistent)
+        self.assertTrue(exp.work_consistent)
+        self.assertIn("让步推迟", exp.report())
+
+
+class TestEscalationOrdering(unittest.TestCase):
+    """多个升级接连提出、升级又撤回、同时切换模式：
+    每项承诺的生效范围与先后关系都保留。"""
+
+    def test_stacked_and_revoked_with_mode_switch(self):
+        modes = [
+            ModeSpec("normal"),
+            ModeSpec("fast", periods={"K": 50}),
+        ]
+        sys_ = System(
+            tasks=[
+                TaskSpec("L", 1, [run(30)], period=100),
+                TaskSpec("K", 2, [run(10)], period=100),
+            ],
+            costs=COSTS,
+            modes=modes,
+            initial_mode="normal",
+        )
+        e1 = sys_.escalate("K", 3, strategy="defer", at_time=2)
+        e2 = sys_.escalate("K", 6, strategy="defer", at_time=4)
+        sys_.switch_mode("fast", "immediate")
+        sys_.run_until(3)
+        self.assertEqual(sys_.escalations[e1].state, "active")
+        self.assertEqual(sys_.escalations[e1].applied_at, 2)
+        sys_.run_until(5)
+        k = sys_.jobs[1]
+        self.assertEqual(k.esc_boost, 6)   # e2 生效后取两者最大增量
+        sys_.revoke(e2)
+        self.assertEqual(k.esc_boost, 3)   # e1 仍在生效
+        sys_.revoke(e1)
+        self.assertEqual(k.esc_boost, 0)
+        # 每项承诺的生效范围与先后关系可逐项回放
+        self.assertEqual(
+            [(e.state, e.applied_at, e.ended_at) for e in sys_.escalations],
+            [("revoked", 2, 5), ("revoked", 4, 5)],
+        )
+        # 模式切换事件与升级事件各自保序、互不吞没
+        self.assertEqual([m.mode for m in sys_.mode_events],
+                         ["normal", "fast"])
+        sys_.run_until(60)
+        assert_contiguous(self, sys_, 60)

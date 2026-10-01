@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-from .system import Job, MissRecord, System
+from .system import DeferralRecord, Job, MissRecord, System
 
 
 @dataclass
@@ -27,6 +27,7 @@ class MissExplanation:
     preemptions: Dict[str, int]       # 高优先级任务名 -> 拍数
     inversions: Dict[str, int]        # 低优先级任务名 -> 拍数（反转/阻塞）
     interrupts: Dict[str, int]        # 中断源名 -> 拍数
+    deferrals: Dict[int, int]         # 升级编号 -> 让步推迟拍数
     mode_breakdown: Dict[str, Dict[str, int]]
     release_mode: str
     deadline_mode: str
@@ -50,9 +51,11 @@ class MissExplanation:
 
 def explain_miss(sys: System, jid: int) -> MissExplanation:
     job = _find_job(sys, jid)
-    release, deadline = job.release, job.abs_deadline
-    window = deadline - release
     miss = _find_miss(sys, jid)
+    # 窗口使用截止瞬间冻结的 MissRecord：升级可能临时收紧截止、撤回又恢复，
+    # 事后读 job.abs_deadline 会把既成超期事实的窗口改掉。
+    release, deadline = miss.release, miss.deadline
+    window = deadline - release
     # 必须使用截止瞬间冻结的剩余工作量，不能事后再读 job.remaining_work()：
     # 作业可能在截止之后补完，事后状态会把“还差一拍”误报成“剩余零拍”。
     remaining_at_deadline = miss.remaining_work
@@ -65,11 +68,38 @@ def explain_miss(sys: System, jid: int) -> MissExplanation:
         "idle": 0,            # 空转（自己未就绪/被阻塞且无人可跑）
         "preempted": 0,       # 被更高优先级任务抢占
         "inversion": 0,       # 低优先级任务运行造成的反转/阻塞
+        "deferred": 0,        # 因关键程度升级的让步策略被推迟
     }
     preemptions: Dict[str, int] = {}
     inversions: Dict[str, int] = {}
     interrupts: Dict[str, int] = {}
+    deferrals: Dict[int, int] = {}
     mode_breakdown: Dict[str, Dict[str, int]] = {}
+
+    # 本作业在窗口内被让步推迟的区间（升级编号 -> [起点, 终点) 列表）；
+    # 终点缺省为“至今未恢复”，按当前时刻截断到窗口内。
+    defer_intervals = []
+    for rec in sys.deferrals:
+        if rec.jid != jid:
+            continue
+        end = rec.resumed_at if rec.resumed_at is not None else sys.now
+        defer_intervals.append((rec.eid, rec.deferred_at, end))
+
+    def deferred_overlap(lo: int, hi: int) -> int:
+        total = 0
+        for _, a, b in defer_intervals:
+            total += max(0, min(hi, b) - max(lo, a))
+        return total
+
+    def add_deferral(lo: int, hi: int, mode_name: str):
+        for eid, a, b in defer_intervals:
+            n = max(0, min(hi, b) - max(lo, a))
+            if n > 0:
+                deferrals[eid] = deferrals.get(eid, 0) + n
+        n = deferred_overlap(lo, hi)
+        if n > 0:
+            cats["deferred"] += n
+            add_mode_time(mode_name, "deferred", n)
 
     def add_mode_time(mode_name: str, category: str, amount: int):
         bucket = mode_breakdown.setdefault(mode_name, {})
@@ -96,26 +126,36 @@ def explain_miss(sys: System, jid: int) -> MissExplanation:
             name = seg.detail.split(":", 1)[1]
             interrupts[name] = interrupts.get(name, 0) + n
         elif seg.kind == "idle":
-            cats["idle"] += n
-            add_mode_time(seg.mode or "default", "idle", n)
+            n_def = deferred_overlap(lo, hi)
+            if n_def:
+                add_deferral(lo, hi, seg.mode or "default")
+            if n - n_def:
+                cats["idle"] += n - n_def
+                add_mode_time(seg.mode or "default", "idle", n - n_def)
         elif seg.jid is not None:
             other = _find_job(sys, seg.jid)
-            if other.base_priority >= job.base_priority:
-                cats["preempted"] += n
-                add_mode_time(seg.mode or "default", "preempted", n)
-                preemptions[other.task.name] = (
-                    preemptions.get(other.task.name, 0) + n)
-            else:
-                cats["inversion"] += n
-                add_mode_time(seg.mode or "default", "inversion", n)
-                inversions[other.task.name] = (
-                    inversions.get(other.task.name, 0) + n)
+            n_def = deferred_overlap(lo, hi)
+            if n_def:
+                # 让步期间别人在跑：根本原因是推迟承诺，而非普通抢占
+                add_deferral(lo, hi, seg.mode or "default")
+            rest = n - n_def
+            if rest:
+                if other.base_priority >= job.base_priority:
+                    cats["preempted"] += rest
+                    add_mode_time(seg.mode or "default", "preempted", rest)
+                    preemptions[other.task.name] = (
+                        preemptions.get(other.task.name, 0) + rest)
+                else:
+                    cats["inversion"] += rest
+                    add_mode_time(seg.mode or "default", "inversion", rest)
+                    inversions[other.task.name] = (
+                        inversions.get(other.task.name, 0) + rest)
 
     accounted = sum(cats.values())
     lines = _build_lines(
         job, window, cats, preemptions, inversions, interrupts, accounted,
-        remaining_at_deadline, mode_breakdown, miss.release_mode,
-        miss.deadline_mode,
+        remaining_at_deadline, mode_breakdown, miss,
+        defer_intervals, deferrals, sys,
     )
     return MissExplanation(
         jid=jid,
@@ -127,6 +167,7 @@ def explain_miss(sys: System, jid: int) -> MissExplanation:
         preemptions=preemptions,
         inversions=inversions,
         interrupts=interrupts,
+        deferrals=deferrals,
         mode_breakdown=mode_breakdown,
         release_mode=miss.release_mode,
         deadline_mode=miss.deadline_mode,
@@ -144,6 +185,28 @@ def _find_miss(sys: System, jid: int) -> MissRecord:
     raise KeyError("job with jid=%r has no deadline-miss record" % (jid,))
 
 
+def explain_deferrals(sys: System) -> List[str]:
+    """逐项列出所有让步推迟：哪个作业、何时被推迟、何时恢复及原因。
+
+    尚未恢复的作业明确标注“至今未恢复”及其原因，便于比较不同
+    让步策略（defer / priority）下各任务被推迟的代价。
+    """
+    lines = []
+    if not sys.deferrals:
+        lines.append("没有任何任务被让步推迟。")
+        return lines
+    for rec in sys.deferrals:
+        head = "作业 %s#%d 在 [%d, " % (rec.task, rec.jid, rec.deferred_at)
+        if rec.resumed_at is None:
+            lines.append(head + "至今) 被推迟，仍未恢复；原因：" + rec.cause)
+        else:
+            lines.append(
+                head + "%d) 被推迟，于 %d 恢复（%s）；原因：%s"
+                % (rec.resumed_at, rec.resumed_at, rec.reason, rec.cause)
+            )
+    return lines
+
+
 def _find_job(sys: System, jid: int) -> Job:
     for job in sys.jobs:
         if job.jid == jid:
@@ -153,12 +216,13 @@ def _find_job(sys: System, jid: int) -> Job:
 
 def _build_lines(job, window, cats, preemptions, inversions,
                  interrupts, accounted, remaining, mode_breakdown,
-                 release_mode, deadline_mode) -> List[str]:
+                 miss, defer_intervals, deferrals, sys) -> List[str]:
+    release_mode, deadline_mode = miss.release_mode, miss.deadline_mode
     lines = []
     lines.append(
         "任务 %s 的作业 #%d 错过截止时间：窗口 [%d, %d) 共 %d 拍，"
         "截止瞬间还差 %d 拍计算（WCET %d 拍，窗口内已执行 %d 拍）。"
-        % (job.task.name, job.jid, job.release, job.abs_deadline,
+        % (job.task.name, job.jid, miss.release, miss.deadline,
            window, remaining, job.task.wcet, cats["self_run"])
     )
     lines.append(
@@ -185,6 +249,24 @@ def _build_lines(job, window, cats, preemptions, inversions,
         )
     if cats["idle"]:
         lines.append("- 空转 %d 拍" % cats["idle"])
+    if cats["deferred"]:
+        detail = ", ".join(
+            "升级 #%d %d拍" % kv for kv in sorted(deferrals.items()))
+        lines.append(
+            "- 因关键程度升级被让步推迟 %d 拍（%s）"
+            % (cats["deferred"], detail)
+        )
+        for eid, a, b in defer_intervals:
+            rec = next((r for r in sys.deferrals
+                        if r.jid == job.jid and r.eid == eid
+                        and r.deferred_at == a), None)
+            if rec is not None and rec.resumed_at is None:
+                lines.append(
+                    "  · [%d, 至今) 仍未恢复：%s" % (a, rec.cause))
+            elif rec is not None:
+                lines.append(
+                    "  · [%d, %d) 已恢复：%s"
+                    % (a, rec.resumed_at, rec.reason))
     if len(mode_breakdown) > 1 or any(
             mode_name != release_mode for mode_name in mode_breakdown):
         detail_parts = []

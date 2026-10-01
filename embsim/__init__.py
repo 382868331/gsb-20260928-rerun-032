@@ -14,8 +14,15 @@ from .model import (
     run,
     unlock,
 )
-from .system import Job, MissRecord, Segment, System
-from .explain import MissExplanation, explain_miss
+from .system import (
+    DeferralRecord,
+    Escalation,
+    Job,
+    MissRecord,
+    Segment,
+    System,
+)
+from .explain import MissExplanation, explain_deferrals, explain_miss
 
 __all__ = [
     "Costs",
@@ -30,6 +37,9 @@ __all__ = [
     "MissRecord",
     "Segment",
     "System",
+    "DeferralRecord",
+    "Escalation",
     "MissExplanation",
     "explain_miss",
+    "explain_deferrals",
 ]

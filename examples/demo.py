@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from embsim import Costs, InterruptSource, System, TaskSpec, explain_miss
-from embsim import lock, run, unlock
+from embsim import explain_deferrals, lock, run, unlock
 
 
 def build(h_deadline):
@@ -73,3 +73,35 @@ chain.run_until(25)
 j = {x.task.name: x for x in chain.jobs}
 print("解除后恢复：M boost =", j["M"].boost, "，H 完成于",
       j["H"].completed_at)
+print()
+print("=== 关键程度临时升级：defer 让步策略 ===")
+esc = System(
+    tasks=[
+        TaskSpec("L", 1, [lock("R"), run(2), unlock("R"), run(2)],
+                 period=100),
+        TaskSpec("K", 2, [run(1), lock("R"), run(1), unlock("R")],
+                 period=100, offset=2),
+    ],
+    costs=Costs(1, 1, 1),
+)
+esc.escalate("K", 5, strategy="defer", at_time=0)
+esc.run_until(20)
+show(esc)
+print()
+for line in explain_deferrals(esc):
+    print(line)
+print()
+print("=== 对比：priority 策略（只抬优先级，不推迟任何任务） ===")
+esc2 = System(
+    tasks=[
+        TaskSpec("L", 1, [lock("R"), run(2), unlock("R"), run(2)],
+                 period=100),
+        TaskSpec("K", 2, [run(1), lock("R"), run(1), unlock("R")],
+                 period=100, offset=2),
+    ],
+    costs=Costs(1, 1, 1),
+)
+esc2.escalate("K", 5, strategy="priority", at_time=0)
+esc2.run_until(20)
+for line in explain_deferrals(esc2):
+    print(line)

@@ -43,6 +43,9 @@ class Job:
     blocked_on: Optional[str] = None
     lock_request_mode: Optional[str] = None
     boost: int = 0                   # 继承得到的优先级增量
+    esc_boost: int = 0               # 关键程度升级得到的优先级增量
+    deferred: bool = False           # 是否因让步策略被推迟
+    orig_deadline: int = 0           # 释放时承诺的绝对截止（升级可临时收紧）
     completed_at: Optional[int] = None
     missed: bool = False
     record: Dict = field(default_factory=dict)
@@ -53,7 +56,7 @@ class Job:
 
     @property
     def eff_priority(self) -> int:
-        return self.task.priority + self.boost
+        return self.task.priority + self.boost + self.esc_boost
 
     def remaining_work(self) -> int:
         left = 0
@@ -113,6 +116,52 @@ class LockBudgetViolation:
     released_at: Optional[int] = None
 
 
+@dataclass
+class Escalation:
+    """一次关键程度升级承诺。
+
+    trigger: "time"（到达指定拍边界）/ "lock"（目标任务获得某资源）/
+    "step"（目标任务程序计数到达某步）。触发后目标作业获得
+    priority_raise 的优先级增量；若给出 response，其绝对截止被临时收紧为
+    applied_at + response（不晚于原承诺截止）。strategy 决定其他低关键
+    任务如何让步：
+    - "priority": 只抬优先级，不额外推迟任何任务；
+    - "defer":    有效优先级低于升级目标的作业被推迟，但持有资源的
+                  作业必须先完成临界区（已占有的资源不能凭空消失），
+                  放锁后才可暂停，保证锁最终一定被释放。
+    state: pending -> active -> revoked/done，生效范围与先后关系全部
+    保留在 escalations 列表里，不会被后来的升级或撤回改写。
+    """
+
+    eid: int
+    task: str
+    trigger: str
+    trigger_arg: object
+    priority_raise: int
+    response: Optional[int]
+    strategy: str
+    state: str = "pending"
+    requested_at: int = 0
+    applied_at: Optional[int] = None
+    ended_at: Optional[int] = None
+    end_reason: Optional[str] = None
+    target_jid: Optional[int] = None
+    saved_deadline: Optional[int] = None
+
+
+@dataclass
+class DeferralRecord:
+    """一次让步推迟记录：哪个作业、何时被推迟、何时恢复及原因。"""
+
+    jid: int
+    task: str
+    eid: int
+    deferred_at: int
+    cause: str
+    resumed_at: Optional[int] = None
+    reason: Optional[str] = None
+
+
 class System:
     def __init__(
         self,
@@ -140,6 +189,9 @@ class System:
         ]
         self.pending_mode_change: Optional[ModeEvent] = None
         self.lock_budget_violations: List[LockBudgetViolation] = []
+        self.escalations: List[Escalation] = []
+        self.deferrals: List[DeferralRecord] = []
+        self._next_eid = 0
 
         self.now = 0
         self.jobs: List[Job] = []
@@ -193,6 +245,7 @@ class System:
                     task=t,
                     release=self.now,
                     abs_deadline=self.now + rel_deadline,
+                    orig_deadline=self.now + rel_deadline,
                     period=period,
                     rel_deadline=rel_deadline,
                     mode=release_mode,
@@ -256,6 +309,7 @@ class System:
             job.lock_request_mode = None
             job.pc += 1
             self._prime_step(job)
+            self._check_escalation_triggers(job, ("lock", res_name))
         else:
             job.state = "blocked"
             job.blocked_on = res_name
@@ -323,17 +377,198 @@ class System:
             s = job.task.program[job.pc]
             if s.kind == "run":
                 job.step_left = s.arg
+            self._check_escalation_triggers(job, ("step", job.pc))
         else:
             job.state = "done"
             job.completed_at = self.now + 1
             job.boost = 0  # 解除后恢复：完成作业不再向任何持有者传递优先级
+            self._end_escalations_of(job)
+            self._recompute_escalation_effects()
             if self.current is job:
                 self.current = None
 
     # ------------------------------------------------------------ 选择
 
     def _ready_jobs(self) -> List[Job]:
-        return [j for j in self.jobs if j.state in ("ready", "running")]
+        return [j for j in self.jobs
+                if j.state in ("ready", "running") and not j.deferred]
+
+    # ------------------------------------------------------------ 关键程度升级
+
+    def escalate(
+        self,
+        task_name: str,
+        priority_raise: int,
+        response: Optional[int] = None,
+        strategy: str = "defer",
+        at_time: Optional[int] = None,
+        on_lock: Optional[str] = None,
+        on_step: Optional[int] = None,
+    ) -> int:
+        """请求临时提高某任务的关键程度，返回升级编号 eid。
+
+        触发事件三选一（缺省为 at_time=当前时刻，即下一拍边界生效）：
+        at_time=t  到达指定拍边界；on_lock=R  目标任务获得资源 R；
+        on_step=k  目标任务程序计数到达第 k 步。
+        response 给出触发后更紧的响应要求（新的相对截止，按拍计）；
+        strategy 为 "defer"（低关键任务让步推迟）或 "priority"（仅抬优先级）。
+        请求本身不占 CPU，不回滚任何已消耗的执行时间或已占有的资源。
+        """
+        if task_name not in self.tasks:
+            raise KeyError("unknown task: %r" % task_name)
+        if strategy not in ("defer", "priority"):
+            raise ValueError("unknown escalation strategy: %r" % strategy)
+        triggers = [t is not None for t in (at_time, on_lock, on_step)]
+        if sum(triggers) > 1:
+            raise ValueError("escalation trigger must be unique")
+        if on_lock is not None:
+            trigger, arg = "lock", on_lock
+        elif on_step is not None:
+            trigger, arg = "step", on_step
+        else:
+            trigger, arg = "time", self.now if at_time is None else at_time
+            if arg < self.now:
+                raise ValueError("escalation time cannot be in the past")
+        if response is not None and response <= 0:
+            raise ValueError("response must be positive")
+        event = Escalation(
+            eid=self._next_eid,
+            task=task_name,
+            trigger=trigger,
+            trigger_arg=arg,
+            priority_raise=priority_raise,
+            response=response,
+            strategy=strategy,
+            requested_at=self.now,
+        )
+        self._next_eid += 1
+        self.escalations.append(event)
+        return event.eid
+
+    def revoke(self, eid: int):
+        """撤回升级承诺：优先级增量与收紧的截止即刻（当前拍边界）解除，
+        被推迟的作业恢复；已记录的超期事实保持冻结，不被改写。"""
+        event = next((e for e in self.escalations if e.eid == eid), None)
+        if event is None:
+            raise KeyError("no escalation with eid=%r" % (eid,))
+        if event.state not in ("pending", "active"):
+            raise ValueError("escalation #%d already ended" % eid)
+        event.state = "revoked"
+        event.ended_at = self.now
+        event.end_reason = "revoked"
+        self._recompute_escalation_effects()
+        self._update_deferrals()
+
+    def _check_escalation_triggers(self, job=None, event=None):
+        for esc in self.escalations:
+            if esc.state != "pending":
+                continue
+            if esc.trigger == "time":
+                if self.now < esc.trigger_arg:
+                    continue
+                target = self._live_job_of(esc.task)
+                if target is not None:
+                    self._apply_escalation(esc, target)
+            elif esc.trigger == "lock" and job is not None:
+                kind, res_name = event
+                if job.task.name == esc.task and res_name == esc.trigger_arg:
+                    self._apply_escalation(esc, job)
+            elif esc.trigger == "step" and job is not None:
+                if job.task.name == esc.task and job.pc == esc.trigger_arg:
+                    self._apply_escalation(esc, job)
+
+    def _live_job_of(self, task_name: str) -> Optional[Job]:
+        live = [j for j in self.jobs
+                if j.task.name == task_name and j.state != "done"]
+        return max(live, key=lambda j: j.jid) if live else None
+
+    def _apply_escalation(self, esc: Escalation, job: Job):
+        esc.state = "active"
+        esc.applied_at = self.now
+        esc.target_jid = job.jid
+        if esc.response is not None:
+            esc.saved_deadline = job.abs_deadline
+        self._recompute_escalation_effects()
+        self._update_deferrals()
+
+    def _end_escalations_of(self, job: Job):
+        for esc in self.escalations:
+            if esc.state == "active" and esc.target_jid == job.jid:
+                esc.state = "done"
+                esc.ended_at = job.completed_at
+                esc.end_reason = "job completed"
+
+    def _recompute_escalation_effects(self):
+        for job in self.jobs:
+            active = [e for e in self.escalations
+                      if e.state == "active" and e.target_jid == job.jid]
+            job.esc_boost = max((e.priority_raise for e in active), default=0)
+            touched = any(
+                e.target_jid == job.jid and e.saved_deadline is not None
+                for e in self.escalations
+            )
+            if active or touched:
+                tightened = [e.applied_at + e.response
+                             for e in active if e.response is not None]
+                job.abs_deadline = min([job.orig_deadline] + tightened)
+
+    def _update_deferrals(self):
+        active = [e for e in self.escalations
+                  if e.state == "active" and e.strategy == "defer"]
+        targets = {}
+        for esc in active:
+            t = next((j for j in self.jobs if j.jid == esc.target_jid), None)
+            if t is not None and t.state != "done":
+                targets[esc.eid] = t
+        want = {}
+        for job in self.jobs:
+            if job.state not in ("ready", "running") or job.held:
+                continue
+            best = None
+            for esc in active:
+                t = targets.get(esc.eid)
+                if t is None or t is job:
+                    continue
+                if job.eff_priority < t.eff_priority and (
+                        best is None
+                        or t.eff_priority > targets[best].eff_priority):
+                    best = esc.eid
+            if best is not None:
+                want[job.jid] = best
+        for job in self.jobs:
+            desired = want.get(job.jid)
+            if desired is not None and not job.deferred:
+                job.deferred = True
+                target = targets[desired]
+                self.deferrals.append(DeferralRecord(
+                    jid=job.jid,
+                    task=job.task.name,
+                    eid=desired,
+                    deferred_at=self.now,
+                    cause="升级 #%d 生效：任务 %s 关键程度临时提高（有效优先级 "
+                          "%d），本作业有效优先级 %d 且未持有资源，按 defer "
+                          "策略让步" % (desired, target.task.name,
+                                        target.eff_priority,
+                                        job.eff_priority),
+                ))
+            elif desired is None and job.deferred:
+                job.deferred = False
+                rec = next((r for r in reversed(self.deferrals)
+                            if r.jid == job.jid and r.resumed_at is None),
+                           None)
+                if rec is not None:
+                    rec.resumed_at = self.now
+                    rec.reason = self._resume_reason(job, rec)
+
+    def _resume_reason(self, job: Job, rec: DeferralRecord) -> str:
+        if job.held:
+            return "获得资源，须先完成临界区"
+        esc = next((e for e in self.escalations if e.eid == rec.eid), None)
+        if esc is not None and esc.state == "revoked":
+            return "升级 #%d 已撤回" % esc.eid
+        if esc is not None and esc.state == "done":
+            return "升级 #%d 的目标作业已完成" % esc.eid
+        return "不再低于任何生效升级的让步门槛"
 
     def _select(self) -> Optional[Job]:
         ready = self._ready_jobs()
@@ -427,6 +662,7 @@ class System:
         """推进一拍（切换决策本身不耗拍，切换开销在后续拍计入）。"""
         self._apply_due_mode_change()
         self._release_due()
+        self._update_deferrals()
 
         if self._irq_pending:
             top = self._isr_stack[-1] if self._isr_stack else None
@@ -505,6 +741,7 @@ class System:
     def _finish_tick(self):
         self.now += 1
         self._apply_due_mode_change(self.now)
+        self._check_escalation_triggers()
         for job in self.jobs:
             if (not job.missed and job.state != "done"
                     and self.now >= job.abs_deadline):
