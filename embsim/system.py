@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pickle
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .model import (
     Costs,
@@ -49,7 +49,9 @@ class Job:
     blocked_on: Optional[str] = None
     lock_request_mode: Optional[str] = None
     boost: int = 0                   # 继承得到的优先级增量
-    deferred_by: Optional[str] = None  # 被哪条承诺延后（承诺名）
+    # 被哪些承诺同时延后（逐项保留来源）；deferred_by 为兼容旧调用的
+    # 代表来源（按最早升级序），实际判据始终是 deferred_by_sources。
+    deferred_by_sources: List[str] = field(default_factory=list)
     release_commitment: Optional[str] = None  # 释放时生效的升级承诺
     completed_at: Optional[int] = None
     missed: bool = False
@@ -62,6 +64,10 @@ class Job:
     @property
     def eff_priority(self) -> int:
         return self.task.priority + self.boost
+
+    @property
+    def deferred_by(self) -> Optional[str]:
+        return self.deferred_by_sources[0] if self.deferred_by_sources else None
 
     def remaining_work(self) -> int:
         left = 0
