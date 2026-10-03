@@ -628,9 +628,9 @@ class TestCriticalityEscalation(unittest.TestCase):
         self.assertEqual(
             [(e.time, e.task, e.resumed_at)
              for e in timeline],
-            [(4, "L", 5), (4, "M", 12), (9, "L", 12)],
+            [(4, "M", 12), (9, "L", 12)],
         )
-        self.assertIn("锁", timeline[0].resume_reason)
+        self.assertIn("承诺撤回", timeline[0].resume_reason)
         # M 延后期间已消耗的 3 拍没有消失：[13,14) 补完最后 1 拍
         sys_.run_until(14)
         m_job = next(j for j in sys_.jobs if j.task.name == "M")
@@ -834,12 +834,215 @@ class TestCriticalityEscalation(unittest.TestCase):
             at_time=4,
         )
         sys_.run_until(11)
-        pending = sys_.pending_deferrals()
-        tasks = {p["task"]: p for p in pending}
-        self.assertEqual(set(tasks), {"L", "M"})
-        self.assertEqual(tasks["M"]["remaining_work"], 1)
-        self.assertEqual(tasks["L"]["commitment"], "c1")
-        self.assertIsNotNone(tasks["L"]["deferred_at"])
+        timeline = sys_.concession_timeline()
+        self.assertEqual(
+            [(e.task, e.time, e.resumed_at) for e in timeline],
+            [("M", 4, None), ("L", 9, None)],
+        )
+        pending = {p["task"]: p for p in sys_.pending_deferrals()}
+        self.assertEqual(set(pending), {"L", "M"})
+        self.assertEqual(pending["M"]["remaining_work"], 1)
+
+
+class TestTemporaryTransferProvenance(unittest.TestCase):
+    def build_nested(self):
+        return System(
+            tasks=[
+                TaskSpec("L", 1, [lock("Q"), run(3), unlock("Q")],
+                         period=100),
+                TaskSpec("M", 2,
+                         [lock("R"), run(1), lock("Q"), run(1),
+                          unlock("Q"), unlock("R")],
+                         period=100, offset=1),
+                TaskSpec("H", 3, [lock("R"), run(1), unlock("R")],
+                         period=100, offset=3),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+        )
+
+    def test_nested_grant_follows_real_release_chain(self):
+        sys_ = self.build_nested()
+        sys_.escalate(
+            CriticalityCommitment("hot", "H", priority=5,
+                                  strategy="defer"),
+            at_time=3,
+        )
+        sys_.run_until(7)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        self.assertEqual(jobs["H"].state, "blocked")
+        self.assertEqual(jobs["M"].state, "blocked")
+        grants = sys_.execution_grant_timeline()
+        by_holder = {}
+        hot_grants = [g for g in grants if g.commitment == "hot"]
+        for grant in hot_grants:
+            by_holder.setdefault(grant.holder_task, []).append(grant)
+        self.assertTrue(by_holder["M"])
+        self.assertTrue(by_holder["L"])
+        for grant in hot_grants:
+            self.assertEqual(grant.commitment, "hot")
+            self.assertEqual(grant.root_waiter_task, "H")
+        m_grant = by_holder["M"][-1]
+        l_grant = by_holder["L"][-1]
+        self.assertEqual((m_grant.resource, m_grant.level), ("R", 5))
+        self.assertEqual((l_grant.resource, l_grant.level), ("Q", 5))
+        self.assertEqual(len(l_grant.path), 2)
+        self.assertEqual(jobs["M"].eff_priority, 5)
+        self.assertEqual(jobs["L"].eff_priority, 5)
+
+        sys_.run_until(12)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        self.assertEqual(jobs["L"].completed_at, 9)
+        self.assertEqual(jobs["M"].eff_priority, 5)
+
+        sys_.run_until(15)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        self.assertEqual(jobs["M"].completed_at, 13)
+        q_grant = next(g for g in sys_.execution_grant_timeline(False)
+                       if g.holder_task == "L" and g.resource == "Q")
+        self.assertFalse(q_grant.active)
+        self.assertEqual(q_grant.lost_reason,
+                         "等待边、升级请求或资源归属已失效")
+
+    def test_two_upgrades_sharing_holder_keep_sources(self):
+        sys_ = System(
+            tasks=[
+                TaskSpec("L", 1,
+                         [lock("R"), run(3), unlock("R"), run(2)],
+                         period=100),
+                TaskSpec("H1", 3, [lock("R"), run(1), unlock("R")],
+                         period=100, offset=1),
+                TaskSpec("H2", 3, [lock("R"), run(1), unlock("R")],
+                         period=100, offset=2),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+        )
+        sys_.escalate(CriticalityCommitment("c1", "H1", priority=5),
+                      at_time=1)
+        sys_.escalate(CriticalityCommitment("c2", "H2", priority=6),
+                      at_time=2)
+        sys_.run_until(4)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        self.assertEqual(jobs["L"].eff_priority, 6)
+        roots = {
+            g.root_waiter_task: g
+            for g in sys_.execution_grant_timeline()
+            if g.holder_task == "L" and g.resource == "R"
+        }
+        self.assertEqual(set(roots), {"H1", "H2"})
+        self.assertEqual(roots["c1" and "H1"].commitment, "c1")
+        self.assertEqual(roots["H2"].commitment, "c2")
+
+        sys_.withdraw("c1", at_time=4)
+        sys_.run_until(5)
+        active = [g for g in sys_.execution_grant_timeline()
+                  if g.holder_task == "L" and g.resource == "R"
+                  and g.commitment is not None]
+        self.assertEqual([g.commitment for g in active], ["c2"])
+        self.assertEqual(jobs["L"].eff_priority, 6)
+        expired = next(g for g in sys_.execution_grant_timeline(False)
+                       if g.commitment == "c1"
+                       and g.holder_task == "L"
+                       and g.resource == "R")
+        self.assertFalse(expired.active)
+
+    def test_release_one_resource_removes_only_that_basis(self):
+        sys_ = System(
+            tasks=[
+                TaskSpec("L", 1,
+                         [lock("Q"), lock("R"), run(2),
+                          unlock("Q"), run(1), unlock("R")],
+                         period=100),
+                TaskSpec("HQ", 3, [lock("Q"), run(1), unlock("Q")],
+                         period=100, offset=2),
+                TaskSpec("HR", 4, [lock("R"), run(1), unlock("R")],
+                         period=100, offset=3),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+        )
+        sys_.escalate(CriticalityCommitment("cq", "HQ", priority=5),
+                      at_time=1)
+        sys_.escalate(CriticalityCommitment("cr", "HR", priority=6),
+                      at_time=2)
+        sys_.run_until(7)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        self.assertEqual(jobs["HQ"].state, "ready")
+        self.assertEqual(jobs["HR"].state, "blocked")
+        self.assertEqual(jobs["L"].held, ["R"])
+        active = {(g.commitment, g.resource)
+                  for g in sys_.execution_grant_timeline()}
+        self.assertNotIn(("cq", "Q"), active)
+        self.assertIn(("cr", "R"), active)
+
+    def test_resource_cycle_does_not_fake_release_or_block_independent_job(self):
+        sys_ = System(
+            tasks=[
+                TaskSpec("A", 2,
+                         [lock("R"), run(1), lock("Q"), run(1),
+                          unlock("Q"), unlock("R")],
+                         period=100),
+                TaskSpec("B", 3,
+                         [lock("Q"), run(1), lock("R"), run(1),
+                          unlock("R"), unlock("Q")],
+                         period=100, offset=1),
+                TaskSpec("X", 1, [run(2)], period=100, offset=5),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+        )
+        sys_.run_until(7)
+        sys_.escalate(CriticalityCommitment(
+            "hot", "A", priority=9, strategy="inherit_only"))
+        sys_.run_until(8)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        self.assertEqual(jobs["A"].state, "blocked")
+        self.assertEqual(jobs["B"].state, "blocked")
+        self.assertEqual(jobs["A"].held, ["R"])
+        self.assertEqual(jobs["B"].held, ["Q"])
+        self.assertEqual(jobs["X"].completed_at, 8)
+        reports = sys_.wait_cycle_reports()
+        self.assertEqual(len(reports), 1)
+        self.assertFalse(reports[0]["resolvable_by_priority"])
+        ownership = {o["resource"]: o for o in sys_.resource_ownership()}
+        self.assertEqual(ownership["R"]["holder"], "A")
+        self.assertEqual(ownership["Q"]["holder"], "B")
+        self.assertEqual(jobs["A"].boost, 0)
+        self.assertEqual(jobs["B"].boost, 0)
+
+    def test_compare_transfer_and_snapshot_keep_graph_and_axis(self):
+        sys_ = self.build_nested()
+        sys_.escalate(
+            CriticalityCommitment("hot", "H", priority=5,
+                                  strategy="defer"),
+            at_time=3,
+        )
+        sys_.run_until(3)
+        results = sys_.compare_transfer(15)
+        self.assertTrue(
+            [g for g in results["transfer"]["grants"]
+             if g.source_kind == "commitment"
+        ])
+        self.assertFalse(
+            [g for g in results["original"]["grants"]
+             if g.source_kind == "commitment"
+        ])
+        self.assertEqual(results["transfer"]["cycles"], [])
+        self.assertEqual(results["original"]["cycles"], [])
+
+        whole = System.restore(sys_.snapshot())
+        whole.run_until(15)
+        part = System.restore(sys_.snapshot())
+        part.run_until(11)
+        resumed = System.restore(part.snapshot())
+        resumed.run_until(15)
+        self.assertEqual(segs(whole), segs(resumed))
+        self.assertEqual(
+            [(g.time, g.commitment, g.holder_task, g.resource, g.active)
+             for g in whole.execution_grant_timeline(False)],
+            [(g.time, g.commitment, g.holder_task, g.resource, g.active)
+             for g in resumed.execution_grant_timeline(False)],
+        )
+        self.assertEqual(
+            whole.resource_ownership(), resumed.resource_ownership()
+        )
 
 
 if __name__ == "__main__":

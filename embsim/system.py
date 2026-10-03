@@ -50,9 +50,12 @@ class Job:
     lock_request_mode: Optional[str] = None
     boost: int = 0                   # 继承得到的优先级增量
     deferred_by: Optional[str] = None  # 被哪条承诺延后（承诺名）
+    deferral_sources: List[str] = field(default_factory=list)
     release_commitment: Optional[str] = None  # 释放时生效的升级承诺
     completed_at: Optional[int] = None
     missed: bool = False
+    blocked_ticks: int = 0
+    delayed_ticks: int = 0
     record: Dict = field(default_factory=dict)
 
     @property
@@ -148,6 +151,56 @@ class ConcessionEvent:
     resume_reason: Optional[str] = None
 
 
+@dataclass
+class WaitEdge:
+    """一条“等待者持有请求 -> 当前资源持有者”的活动关系。"""
+
+    generation: int
+    waiter_jid: int
+    waiter_task: str
+    holder_jid: int
+    holder_task: str
+    resource: str
+    created_at: int
+    request_mode: str
+    acquired_mode: str
+    active: bool = True
+    lost_at: Optional[int] = None
+    lost_reason: Optional[str] = None
+
+
+@dataclass
+class TemporaryExecutionGrant:
+    """沿真正阻止资源释放的等待链传递的一次临时执行机会。"""
+
+    time: int
+    generation: int
+    source_kind: str       # priority / commitment
+    commitment: Optional[str]
+    root_waiter_jid: int
+    root_waiter_task: str
+    holder_jid: int
+    holder_task: str
+    resource: str
+    level: int
+    path: tuple
+    in_cycle: bool = False
+    active: bool = True
+    lost_at: Optional[int] = None
+    lost_reason: Optional[str] = None
+
+
+@dataclass
+class WaitCycle:
+    time: int
+    generation: int
+    cycle: tuple
+    resources: tuple
+    active: bool = True
+    resolved_at: Optional[int] = None
+    resolution: Optional[str] = None
+
+
 class System:
     def __init__(
         self,
@@ -155,6 +208,7 @@ class System:
         interrupts: Optional[List[InterruptSource]] = None,
         costs: Costs = Costs(),
         use_inheritance: bool = True,
+        use_transfer: Optional[bool] = None,
         modes: Optional[List[ModeSpec]] = None,
         initial_mode: Optional[str] = None,
         commitments: Optional[List[CriticalityCommitment]] = None,
@@ -163,6 +217,7 @@ class System:
         self.interrupts = interrupts or []
         self.costs = costs
         self.use_inheritance = use_inheritance
+        self.use_transfer = use_inheritance if use_transfer is None else use_transfer
         self.resources: Dict[str, Dict] = {}
         self.modes: Dict[str, ModeSpec] = {}
         if modes:
@@ -191,6 +246,10 @@ class System:
         self.commitment_events: List[CommitmentEvent] = []
         self.concession_events: List[ConcessionEvent] = []
         self._next_commitment_seq = 0
+        self.wait_edges: List[WaitEdge] = []
+        self.execution_grants: List[TemporaryExecutionGrant] = []
+        self.wait_cycles: List[WaitCycle] = []
+        self._next_wait_generation = 0
 
         self.now = 0
         self.jobs: List[Job] = []
@@ -269,8 +328,8 @@ class System:
             else:
                 self.active_commitments.pop(event.name, None)
             self.commitment_events.append(event)
-        # 升级/撤回改变等待者的关键级别，沿等待链的继承压力需重算
-        self._recompute_boosts()
+        # 升级/撤回改变等待者的关键级别与每条等待链的临时执行权
+        self._sync_wait_graph()
         # 承诺集合变化后重新评估谁应当被让步
         self._recompute_deferrals()
 
@@ -332,26 +391,208 @@ class System:
 
     # ------------------------------------------------------------ 优先级继承
 
-    def _recompute_boosts(self):
-        if not self.use_inheritance:
-            return
-        for _ in range(len(self.jobs) + 1):  # 迭代到不动点，覆盖传递阻塞
-            changed = False
-            for job in self.jobs:
-                if job.state == "done":
+    def _job_static_level(self, job: Optional[Job]) -> int:
+        if job is None:
+            return -10**18
+        level = job.base_priority
+        for c in self._job_commitments(job):
+            if c.priority is not None:
+                level = max(level, c.priority)
+        return level
+
+    def _active_wait_map(self) -> Dict[int, List[WaitEdge]]:
+        return {
+            j.jid: [
+                e for e in self.wait_edges
+                if e.active and e.waiter_jid == j.jid
+            ]
+            for j in self.jobs if j.state != "done"
+        }
+
+    def _sync_wait_graph(self):
+        """按当前 holder/waiters 增删等待边，并同步逐项临时执行授权。"""
+        expected = set()
+        for res_name, res in self.resources.items():
+            holder = res["holder"]
+            for waiter in res["waiters"]:
+                if holder is None or waiter is holder:
                     continue
-                want = 0
-                for res_name in job.held:
-                    res = self.resources[res_name]
-                    for w in res["waiters"]:
-                        want = max(want, self._job_crit_level(w)
-                                  - job.base_priority)
-                want = max(0, want)
-                if want != job.boost:
-                    job.boost = want
-                    changed = True
-            if not changed:
-                break
+                expected.add((waiter.jid, holder.jid, res_name))
+
+        current = {
+            (e.waiter_jid, e.holder_jid, e.resource): e
+            for e in self.wait_edges if e.active
+        }
+        for key, edge in current.items():
+            if key not in expected:
+                edge.active = False
+                edge.lost_at = self.now
+                edge.lost_reason = "等待关系消失"
+        for waiter_jid, holder_jid, res_name in sorted(expected):
+            key = (waiter_jid, holder_jid, res_name)
+            if key in current:
+                continue
+            waiter = self.jobs[waiter_jid]
+            holder = self.jobs[holder_jid]
+            res = self.resources[res_name]
+            edge = WaitEdge(
+                generation=self._next_wait_generation,
+                waiter_jid=waiter_jid,
+                waiter_task=waiter.task.name,
+                holder_jid=holder_jid,
+                holder_task=holder.task.name,
+                resource=res_name,
+                created_at=self.now,
+                request_mode=waiter.lock_request_mode or self.mode,
+                acquired_mode=res.get("mode") or self.mode,
+            )
+            self._next_wait_generation += 1
+            self.wait_edges.append(edge)
+        self._refresh_execution_grants()
+        self._refresh_wait_cycles()
+
+    def _outgoing_edges(self) -> Dict[int, List[WaitEdge]]:
+        result: Dict[int, List[WaitEdge]] = {}
+        for edge in self.wait_edges:
+            if edge.active:
+                result.setdefault(edge.waiter_jid, []).append(edge)
+        return result
+
+    def _detect_cycles(self) -> List[tuple]:
+        outgoing = self._outgoing_edges()
+        cycles = []
+        seen_cycles = set()
+        for start in sorted(outgoing):
+            stack = [(start, [start], [])]
+            while stack:
+                node, nodes, edges = stack.pop()
+                for edge in outgoing.get(node, []):
+                    nxt = edge.holder_jid
+                    if nxt == start and nodes:
+                        canonical_nodes = tuple(nodes)
+                        canonical_edges = tuple(
+                            sorted((e.resource, e.waiter_jid, e.holder_jid)
+                                   for e in edges + [edge])
+                        )
+                        if canonical_edges not in seen_cycles:
+                            seen_cycles.add(canonical_edges)
+                            cycles.append((canonical_nodes,
+                                           tuple(e.resource for e in edges + [edge])))
+                    elif nxt not in nodes:
+                        stack.append((nxt, nodes + [nxt], edges + [edge]))
+        return cycles
+
+    def _refresh_wait_cycles(self):
+        found = self._detect_cycles()
+        found_keys = {tuple(sorted(zip(nodes, resources)))
+                      for nodes, resources in found}
+        for record in self.wait_cycles:
+            if not record.active:
+                continue
+            key = tuple(sorted(zip(record.cycle, record.resources)))
+            if key not in found_keys:
+                record.active = False
+                record.resolved_at = self.now
+                record.resolution = "等待环对应边消失"
+        known = {
+            tuple(sorted(zip(r.cycle, r.resources))): r
+            for r in self.wait_cycles
+        }
+        for nodes, resources in found:
+            key = tuple(sorted(zip(nodes, resources)))
+            if key in known:
+                continue
+            self.wait_cycles.append(WaitCycle(
+                time=self.now,
+                generation=self._next_wait_generation,
+                cycle=nodes,
+                resources=resources,
+            ))
+            self._next_wait_generation += 1
+
+    def _root_sources(self, job: Job) -> List[tuple]:
+        sources = []
+        if self.use_inheritance and job.blocked_on is not None:
+            sources.append(("priority", None, job.base_priority, job))
+        if self.use_transfer:
+            for commitment in self._job_commitments(job):
+                if commitment.priority is not None and job.blocked_on is not None:
+                    sources.append(("commitment", commitment.name,
+                                    commitment.priority, job))
+        return sources
+
+    def _refresh_execution_grants(self):
+        outgoing = self._outgoing_edges()
+        cycle_nodes = {
+            jid for cycle in self.wait_cycles if cycle.active
+            for jid in cycle.cycle
+        }
+        wanted = []
+        for root in self.jobs:
+            if root.state == "done" or root.blocked_on is None:
+                continue
+            for kind, commitment_name, level, source_job in self._root_sources(root):
+                stack = [(root, (root.jid,), ())]
+                while stack:
+                    waiter, node_path, edge_path = stack.pop()
+                    for edge in outgoing.get(waiter.jid, []):
+                        if edge.holder_jid in node_path:
+                            continue
+                        path = edge_path + (edge.generation,)
+                        wanted.append((kind, commitment_name, root.jid,
+                                       edge.holder_jid, edge.resource, level,
+                                       path, edge.holder_jid in cycle_nodes))
+                        holder = self.jobs[edge.holder_jid]
+                        if holder.blocked_on is not None:
+                            stack.append((holder, node_path + (holder.jid,),
+                                          path))
+
+        active = {
+            (g.source_kind, g.commitment, g.root_waiter_jid, g.holder_jid,
+             g.resource, g.path): g
+            for g in self.execution_grants if g.active
+        }
+        wanted_keys = set()
+        for kind, commitment_name, root_jid, holder_jid, resource, level, path, in_cycle in wanted:
+            key = (kind, commitment_name, root_jid, holder_jid, resource, path)
+            wanted_keys.add(key)
+            existing = active.get(key)
+            if existing is None:
+                self.execution_grants.append(TemporaryExecutionGrant(
+                    time=self.now,
+                    generation=self._next_wait_generation,
+                    source_kind=kind,
+                    commitment=commitment_name,
+                    root_waiter_jid=root_jid,
+                    root_waiter_task=self.jobs[root_jid].task.name,
+                    holder_jid=holder_jid,
+                    holder_task=self.jobs[holder_jid].task.name,
+                    resource=resource,
+                    level=level,
+                    path=path,
+                    in_cycle=in_cycle,
+                ))
+                self._next_wait_generation += 1
+            else:
+                existing.in_cycle = in_cycle
+                existing.level = level
+        for key, grant in active.items():
+            if key not in wanted_keys:
+                grant.active = False
+                grant.lost_at = self.now
+                grant.lost_reason = "等待边、升级请求或资源归属已失效"
+
+        if not self.use_transfer and not self.use_inheritance:
+            for job in self.jobs:
+                job.boost = 0
+            return
+        for job in self.jobs:
+            want = 0
+            for grant in self.execution_grants:
+                if grant.active and grant.holder_jid == job.jid \
+                        and not grant.in_cycle:
+                    want = max(want, grant.level - job.base_priority)
+            job.boost = max(0, want)
 
     # ------------------------------------------------------------ 关键程度与让步
 
@@ -373,36 +614,24 @@ class System:
                 level = max(level, c.priority)
         return level
 
-    def _protected_holders(self) -> set:
-        """因已升级作业等锁而必须继续完成临界区的持有者集合。
-
-        沿“等待者 -> 持有者”关系传播（含传递等待）：被升级的等待者
-        施压时，整条持锁链上的持有者都不能被让步延后，否则锁永远
-        无法释放。链上的非持锁计算部分（放锁之后的 run）仍可延后。
-        """
-        protected = set()  # 内容为作业 jid
-        # 初始施压者：任何非延后且正在等锁的作业；已升级等待者的关键
-        # 级别同样沿继承传播，保证它等待的锁一定能被持有者放出。
-        stack = [
+    def _protected_holders_for(self, commitment: Optional[CriticalityCommitment]) -> set:
+        roots = [
             j for j in self.jobs
             if j.state not in ("done", "deferred")
             and j.blocked_on is not None
+            and (commitment is None or j.task.name == commitment.task)
         ]
-        seen = set()
+        protected = set()
+        stack = roots
+        seen = {j.jid for j in roots}
+        outgoing = self._outgoing_edges()
         while stack:
             waiter = stack.pop()
-            if waiter.jid in seen:
-                continue
-            seen.add(waiter.jid)
-            for res_name, res in self.resources.items():
-                holder = res["holder"]
-                if holder is None or holder.jid in protected:
-                    continue
-                if waiter is holder or waiter not in res["waiters"]:
-                    continue
+            for edge in outgoing.get(waiter.jid, []):
+                holder = self.jobs[edge.holder_jid]
                 protected.add(holder.jid)
-                # 持有者若自己也在等别的锁，则压力继续向上游传播
-                if holder.blocked_on is not None:
+                if holder.blocked_on is not None and holder.jid not in seen:
+                    seen.add(holder.jid)
                     stack.append(holder)
         return protected
 
@@ -415,33 +644,65 @@ class System:
         - 承诺撤回后不再满足延后条件的作业立即恢复就绪。
         延后不清空 pc/step_left/held：已占有资源与已执行时间原样保留。
         """
-        active = list(self.active_commitments.values())
-        deferring = [c for c in active if c.strategy == "defer"]
+        deferring = [c for c in self.active_commitments.values()
+                     if c.strategy == "defer"]
         if not deferring:
             for job in self.jobs:
-                if job.state == "deferred":
-                    self._resume_job(job, "承诺撤回，让步结束")
+                for name in list(job.deferral_sources):
+                    self._remove_deferral_source(job, name, "承诺撤回，让步结束")
             return
 
         top_level = max(
             (c.priority for c in deferring if c.priority is not None),
             default=None,
         )
-        protected = self._protected_holders()
+        protected_by_any = set()
+        for commitment in deferring:
+            protected_by_any.update(self._protected_holders_for(commitment))
         for job in self.jobs:
             if job.state in ("done", "blocked"):
                 continue
-            commitment = self._deferring_commitment_for(job, deferring,
-                                                        top_level)
-            if commitment is not None and job.jid not in protected:
-                self._defer_job(job, commitment, protected)
-            elif job.state == "deferred" and (
-                    job.jid in protected or commitment is None):
-                reason = (
-                    "作业持有升级任务正在等待的锁，先完成临界区放锁"
-                    if job.jid in protected else "承诺撤回或关键级别不再占优"
+            valid_sources = set()
+            protected_sources = set()
+            for commitment in deferring:
+                target = next(
+                    (j for j in self.jobs
+                     if j.task.name == commitment.task
+                     and j.state not in ("done", "deferred")),
+                    None,
                 )
-                self._resume_job(job, reason)
+                candidate = self._deferring_commitment_for(
+                    job, [commitment], top_level)
+                protected = self._protected_holders_for(commitment)
+                job_has_commitment = any(
+                    other.task == job.task.name for other in deferring)
+                if job_has_commitment:
+                    candidate = None
+                elif target is None or target.state == "done":
+                    candidate = None
+                elif job.held and job.jid not in protected:
+                    candidate = None
+                if candidate is not None and job.jid not in protected:
+                    valid_sources.add(commitment.name)
+                elif candidate is not None:
+                    protected_sources.add(commitment.name)
+            for name in valid_sources:
+                if name not in job.deferral_sources:
+                    self._add_deferral_source(job, self.commitments[name])
+            for name in list(job.deferral_sources):
+                if name in valid_sources:
+                    continue
+                existing_spec = self.commitments.get(name)
+                protected_by_existing = (
+                    job.jid in self._protected_holders_for(existing_spec)
+                    if existing_spec is not None else False
+                )
+                if protected_by_existing:
+                    reason = "作业持有升级任务正在等待的锁，先完成临界区放锁"
+                    protected_sources.add(name)
+                else:
+                    reason = "承诺撤回、资源释放或工作模式切换后该项让步失去依据"
+                self._remove_deferral_source(job, name, reason)
 
     def _deferring_commitment_for(self, job, deferring, top_level):
         """返回要求该作业让步的承诺（取提出最早者），无则 None。"""
@@ -450,6 +711,9 @@ class System:
         for c in deferring:
             # 被升级任务自身、以及同级或更高关键作业不被延后
             if c.task == job.task.name:
+                continue
+            if any(other.task == job.task.name for other in deferring
+                   if other is not c):
                 continue
             if c.priority is not None and job_level >= c.priority:
                 continue
@@ -467,11 +731,8 @@ class System:
         )
         return candidates[0]
 
-    def _defer_job(self, job: Job, commitment: CriticalityCommitment,
-                   protected: set):
-        if job.state == "deferred" and job.deferred_by == commitment.name:
-            return
-        if job.state == "deferred":
+    def _add_deferral_source(self, job: Job, commitment: CriticalityCommitment):
+        if commitment.name in job.deferral_sources:
             return
         if self.current is job and job.state == "running":
             job.state = "ready"
@@ -486,8 +747,9 @@ class System:
                 commitment.strategy,
             )
         )
+        job.deferral_sources.append(commitment.name)
         job.state = "deferred"
-        job.deferred_by = commitment.name
+        job.deferred_by = job.deferral_sources[0]
         # 若正在切换到该作业的路上，取消目标（已付的切换开销留在时间线上）
         if self._switch_to is job:
             self._switch_to = None
@@ -502,18 +764,25 @@ class System:
             reason=reason,
         ))
 
-    def _resume_job(self, job: Job, reason: str):
-        commitment_name = job.deferred_by
+    def _remove_deferral_source(self, job: Job, commitment_name: str,
+                                reason: str):
+        if commitment_name not in job.deferral_sources:
+            return
+        job.deferral_sources.remove(commitment_name)
         event = next(
             (e for e in reversed(self.concession_events)
-             if e.jid == job.jid and e.resumed_at is None),
+             if e.jid == job.jid and e.commitment == commitment_name
+             and e.resumed_at is None),
             None,
         )
         if event is not None:
             event.resumed_at = self.now
             event.resume_reason = reason
-        job.state = "ready"
-        job.deferred_by = None
+        if not job.deferral_sources:
+            job.state = "ready"
+            job.deferred_by = None
+        else:
+            job.deferred_by = job.deferral_sources[0]
 
     # ------------------------------------------------------------ 资源操作
 
@@ -553,7 +822,7 @@ class System:
                 res["waiters"].append(job)
             if self.current is job:
                 self.current = None
-        self._recompute_boosts()
+        self._sync_wait_graph()
         self._recompute_deferrals()
 
     def _do_unlock(self, job: Job, res_name: str):
@@ -577,7 +846,7 @@ class System:
             res["waiters"].clear()
         job.pc += 1
         self._prime_step(job)
-        self._recompute_boosts()
+        self._sync_wait_graph()
         # 放锁后等待链改变：原本被豁免的持有者可能变成可延后作业，
         # 原本延后的等待者若仍被承诺覆盖则继续延后（状态在重算中统一裁决）
         self._recompute_deferrals()
@@ -694,6 +963,8 @@ class System:
         self.mode = event.mode
         self.mode_events.append(event)
         self.pending_mode_change = None
+        self._sync_wait_graph()
+        self._recompute_deferrals()
 
     def _current_worker_job(self) -> Optional[Job]:
         if self.current is not None and self.current.state != "done":
@@ -727,6 +998,11 @@ class System:
         self._apply_due_mode_change()
         self._apply_due_commitment_events()
         self._release_due()
+        for job in self.jobs:
+            if job.state == "blocked":
+                job.blocked_ticks += 1
+            elif job.state == "deferred":
+                job.delayed_ticks += 1
 
         if self._irq_pending:
             top = self._isr_stack[-1] if self._isr_stack else None
@@ -851,7 +1127,6 @@ class System:
         for job in self.jobs:
             if job.state != "deferred":
                 continue
-            spec = self.commitments.get(job.deferred_by)
             event = next(
                 (e for e in reversed(self.concession_events)
                  if e.jid == job.jid and e.resumed_at is None),
@@ -862,13 +1137,109 @@ class System:
                 "task": job.task.name,
                 "deferred_at": event.time if event else None,
                 "commitment": job.deferred_by,
-                "commitment_task": spec.task if spec else None,
-                "strategy": spec.strategy if spec else None,
+                "commitment_sources": list(job.deferral_sources),
+                "commitment_task": (
+                    self.commitments[job.deferred_by].task
+                    if job.deferred_by in self.commitments else None
+                ),
+                "strategy": (
+                    self.commitments[job.deferred_by].strategy
+                    if job.deferred_by in self.commitments else None
+                ),
                 "reason": event.reason if event else None,
                 "remaining_work": job.remaining_work(),
                 "held_resources": list(job.held),
+                "consumed_delay_ticks": job.delayed_ticks,
             })
         return result
+
+    def resource_ownership(self) -> List[Dict]:
+        """返回当前资源归属、等待者和获得资源时冻结的模式预算。"""
+        result = []
+        for name in sorted(self.resources):
+            res = self.resources[name]
+            holder = res["holder"]
+            result.append({
+                "resource": name,
+                "holder": holder.task.name if holder else None,
+                "holder_jid": holder.jid if holder else None,
+                "waiters": [
+                    {"task": w.task.name, "jid": w.jid,
+                     "request_mode": w.lock_request_mode}
+                    for w in res["waiters"]
+                ],
+                "acquired_at": res["acquired_at"],
+                "acquired_mode": res["mode"],
+                "budget": res["budget"],
+            })
+        return result
+
+    def wait_graph(self, active_only: bool = True) -> List[WaitEdge]:
+        """返回等待边；历史边保留其消失时刻和原因。"""
+        return [e for e in self.wait_edges if e.active or not active_only]
+
+    def execution_grant_timeline(self, active_only: bool = True) -> List[TemporaryExecutionGrant]:
+        """逐项返回沿等待链产生的临时执行权及其来源。"""
+        return [g for g in self.execution_grants
+                if g.active or not active_only]
+
+    def active_wait_cycles(self) -> List[WaitCycle]:
+        return [c for c in self.wait_cycles if c.active]
+
+    def wait_cycle_reports(self) -> List[Dict]:
+        """说明哪些环仍真实卡住；提级不能替代锁释放。"""
+        reports = []
+        for cycle in self.wait_cycles:
+            if not cycle.active:
+                continue
+            reports.append({
+                "time": cycle.time,
+                "jobs": tuple(self.jobs[j].task.name for j in cycle.cycle
+                              if 0 <= j < len(self.jobs)),
+                "resources": cycle.resources,
+                "resolvable_by_priority": False,
+                "reason": "环上每个作业都在等待下一作业已占有的资源，"
+                          "提高优先级不会释放任何锁；需要撤回请求、"
+                          "打破资源顺序或让仿真明确停留在阻塞态。",
+            })
+        return reports
+
+    def job_scheduling_summary(self) -> Dict[str, Dict]:
+        return {
+            job.task.name: {
+                "jid": job.jid,
+                "state": job.state,
+                "blocked_ticks": job.blocked_ticks,
+                "delayed_ticks": job.delayed_ticks,
+                "remaining_work": job.remaining_work(),
+                "held_resources": list(job.held),
+                "completed_at": job.completed_at,
+                "missed": job.missed,
+            }
+            for job in self.jobs
+        }
+
+    def compare_transfer(self, horizon: int) -> Dict[str, Dict]:
+        """比较关闭/启用临时执行权传递的调度结果。"""
+        results = {}
+        for enabled in (False, True):
+            clone = System.restore(self.snapshot())
+            clone.use_inheritance = enabled
+            clone.use_transfer = enabled
+            clone.run_until(horizon)
+            key = "transfer" if enabled else "original"
+            results[key] = {
+                "completed": {
+                    j.task.name: j.completed_at
+                    for j in clone.jobs if j.completed_at is not None
+                },
+                "jobs": clone.job_scheduling_summary(),
+                "ownership": clone.resource_ownership(),
+                "cycles": clone.wait_cycle_reports(),
+                "grants": clone.execution_grant_timeline(False),
+                "system": clone,
+            }
+        return results
 
     def compare_concessions(
         self,

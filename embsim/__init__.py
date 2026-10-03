@@ -22,6 +22,9 @@ from .system import (
     MissRecord,
     Segment,
     System,
+    TemporaryExecutionGrant,
+    WaitCycle,
+    WaitEdge,
 )
 from .explain import MissExplanation, explain_miss
 
@@ -41,6 +44,9 @@ __all__ = [
     "MissRecord",
     "Segment",
     "System",
+    "TemporaryExecutionGrant",
+    "WaitCycle",
+    "WaitEdge",
     "MissExplanation",
     "explain_miss",
 ]
