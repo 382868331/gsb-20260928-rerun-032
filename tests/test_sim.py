@@ -1066,5 +1066,124 @@ class TestMultiSourceDeferralAndCycles(unittest.TestCase):
         self.assertEqual(sys_.now, 14)
 
 
+def _cycle_system():
+    """A 持 P 等 Q、B 持 Q 等 P 的真实资源环；D 独立完成。"""
+    sys_ = System(
+        tasks=[
+            TaskSpec("A", 2,
+                     [lock("P"), run(1), lock("Q"), run(1),
+                      unlock("Q"), unlock("P")],
+                     period=100),
+            TaskSpec("B", 3,
+                     [lock("Q"), run(1), lock("P"), run(1),
+                      unlock("P"), unlock("Q")],
+                     period=100, offset=1),
+            TaskSpec("D", 1, [run(3)], period=100),
+        ],
+        costs=Costs(context_switch=0, lock=1, unlock=1),
+    )
+    sys_.run_until(12)
+    return sys_
+
+
+class InterventionRehearsalTest(unittest.TestCase):
+    def test_rehearsal_does_not_change_schedule(self):
+        """预演只推演：资源、状态、时间线与等待环都保持原样。"""
+        sys_ = _cycle_system()
+        jobs = {j.task.name: j for j in sys_.jobs}
+        a, b = jobs["A"], jobs["B"]
+        trace_len = len(sys_.trace)
+        rehearsal = sys_.rehearse_intervention("abort", a.jid)
+        # 预演内容：释放 P、保留已执行的 1 拍、B 可继续、环被点明
+        self.assertEqual(rehearsal.preview["resources_released"], ["P"])
+        self.assertEqual(rehearsal.preview["work_preserved_ticks"], 1)
+        self.assertEqual(rehearsal.preview["waiters_continuing"], [b.jid])
+        self.assertEqual(rehearsal.preview["cycles_involving_job"],
+                         [[a.jid, b.jid]])
+        # 调度未被预演改变
+        self.assertEqual(sys_.now, 12)
+        self.assertEqual(len(sys_.trace), trace_len)
+        self.assertEqual(a.state, "blocked")
+        self.assertEqual(a.held, ["P"])
+        self.assertEqual(len(sys_.wait_cycles()), 1)
+        self.assertEqual([p["rid"] for p in sys_.pending_interventions()],
+                         [rehearsal.rid])
+
+    def test_confirm_abort_releases_and_is_idempotent(self):
+        """确认后释放资源、等待者继续；重复确认不重复释放。"""
+        sys_ = _cycle_system()
+        jobs = {j.task.name: j for j in sys_.jobs}
+        a, b = jobs["A"], jobs["B"]
+        rehearsal = sys_.rehearse_intervention("abort", a.jid)
+        record = sys_.confirm_intervention(rehearsal.rid)
+        self.assertEqual(record.resources_released, ["P"])
+        self.assertEqual(record.waiters_unblocked, [b.jid])
+        self.assertEqual(record.aborted_jid, a.jid)
+        self.assertEqual(record.work_preserved_ticks, 1)
+        self.assertEqual(record.applied_at, 12)
+        self.assertEqual(a.state, "aborted")
+        self.assertEqual(a.held, [])
+        self.assertEqual(sys_.resources["P"]["holder"], None)
+        # 重复确认返回同一记录，不重复释放
+        again = sys_.confirm_intervention(rehearsal.rid)
+        self.assertIs(again, record)
+        self.assertEqual(len(sys_.intervention_records), 1)
+        # 环解除：B 继续并完成，已完成工作保留在账上
+        sys_.run_until(20)
+        self.assertEqual(b.state, "done")
+        self.assertEqual(sys_.wait_cycles(), [])
+        report = sys_.run_report()
+        self.assertEqual([x["task"] for x in report["aborted"]], ["A"])
+        self.assertEqual(len(report["interventions"]), 1)
+        self.assertEqual(report["unresolvable_waits"], [])
+
+    def test_wait_timeout_aborts_stuck_waiter(self):
+        """等待超时：到点仍等不到锁则中止等待者，另一方继续。"""
+        sys_ = _cycle_system()
+        jobs = {j.task.name: j for j in sys_.jobs}
+        a, b = jobs["A"], jobs["B"]
+        rehearsal = sys_.rehearse_intervention("timeout", b.jid, timeout=3)
+        self.assertEqual(rehearsal.preview["would_fire_after"], 3)
+        record = sys_.confirm_intervention(rehearsal.rid)
+        self.assertEqual(record.timeout_at, 15)
+        self.assertIsNone(record.applied_at)
+        # 到点前调度不变
+        sys_.run_until(14)
+        self.assertEqual(b.state, "blocked")
+        sys_.run_until(15)
+        self.assertEqual(b.state, "aborted")
+        self.assertEqual(record.applied_at, 15)
+        self.assertEqual(record.resources_released, ["Q"])
+        self.assertEqual(record.waiters_unblocked, [a.jid])
+        # A 拿到 Q 后继续完成
+        sys_.run_until(25)
+        self.assertEqual(a.state, "done")
+        self.assertEqual(sys_.wait_cycles(), [])
+
+    def test_unconfirmed_rehearsal_survives_snapshot(self):
+        """未确认预演保存重开后仍挂起，确认才生效且不影响原系统。"""
+        sys_ = _cycle_system()
+        a = next(j for j in sys_.jobs if j.task.name == "A")
+        rehearsal = sys_.rehearse_intervention("abort", a.jid)
+        clone = System.restore(sys_.snapshot())
+        # 重开后仍需人工确认
+        pending = clone.pending_interventions()
+        self.assertEqual([p["rid"] for p in pending], [rehearsal.rid])
+        self.assertEqual(clone.jobs[0].state, "blocked")
+        record = clone.confirm_intervention(rehearsal.rid)
+        self.assertEqual(record.resources_released, ["P"])
+        self.assertEqual(clone.jobs[0].state, "aborted")
+        # 原系统未被确认影响
+        self.assertEqual(sys_.jobs[0].state, "blocked")
+        self.assertEqual(sys_.intervention_records, [])
+
+    def test_rehearsal_rejects_finished_job(self):
+        sys_ = _cycle_system()
+        d = next(j for j in sys_.jobs if j.task.name == "D")
+        self.assertEqual(d.state, "done")
+        with self.assertRaises(ValueError):
+            sys_.rehearse_intervention("abort", d.jid)
+
+
 if __name__ == "__main__":
     unittest.main()

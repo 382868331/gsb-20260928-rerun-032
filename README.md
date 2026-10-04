@@ -124,6 +124,25 @@ strategy=...)` 描述一项**临时关键程度承诺**：达到指定事件后�
   `unresolvable_waits`（无法仅靠优先级解除的等待环）、`errors`
   （错过截止与锁预算超期）。
 
+## 等待环的人工处置预演
+
+对 `wait_cycles()` 报出的资源环，操作者可以先**预演**再**确认**：
+
+- `sys.rehearse_intervention("abort", jid)`：预演中止一个尚可撤销
+  （未完成、未中止）的作业；`rehearse_intervention("timeout", jid,
+  timeout=n)` 则为正在等待的作业设置等待超时，确认后 n 拍仍等不到
+  锁时放弃等待并中止。预演只登记与推演，**不改变当前调度**：
+  `preview` 说明将释放哪些资源、已完成的多少拍工作会保留在账上、
+  哪些等待者能够继续（含传递解除与仍被让步延后者）、涉及哪些环。
+- `sys.confirm_intervention(rid)`：明确确认后才执行。确认与重复确认
+  幂等——返回同一份 `InterventionRecord`，不会重复释放资源。
+  记录含实际影响的作业、释放的资源、被唤醒的等待者与生效时刻，
+  可在 `run_report()["interventions"]` 与 `["aborted"]` 中追溯。
+- 被中止作业已执行的 run 拍与已付开销留在时间线上（trace 不改写）；
+  仍被承诺延后的等待者保持延后，不参与本次抢锁。
+- 未确认的预演随快照一并序列化，`pending_interventions()` 在保存
+  重开后依旧挂起，仍需人工确认才生效。
+
 ## 为功耗模型预留的扩展点
 
 - `TaskSpec.attrs` 与 `Job.record` 是开放字典：将来挂功耗参数

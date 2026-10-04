@@ -154,6 +154,45 @@ class ConcessionEvent:
     resume_reason: Optional[str] = None
 
 
+@dataclass
+class InterventionRehearsal:
+    """一次人工处置预演：只登记与推演，不改变当前调度。
+
+    action:  "abort"（中止一个尚可撤销的作业）或
+             "timeout"（为等待中的作业设置等待超时，到点后放弃等待）。
+    preview: 预演推演结果（确认前查看），包含将释放的资源、保留的
+             已完成工作量、能够继续的等待者与涉及的等待环。
+    status:  pending / confirmed / expired（超时到达时作业已不在等待）。
+    """
+
+    rid: int
+    action: str
+    jid: int
+    task: str
+    created_at: int
+    timeout: Optional[int]
+    preview: Dict
+    status: str = "pending"
+
+
+@dataclass
+class InterventionRecord:
+    """一次已确认处置的执行记录：可追溯实际影响的任务与资源。"""
+
+    rid: int
+    action: str
+    jid: int
+    task: str
+    confirmed_at: int
+    applied_at: Optional[int]      # abort 立即生效；timeout 到点生效
+    resources_released: List[str]
+    waiters_unblocked: List[int]   # 因释放而回到就绪的作业 jid
+    aborted_jid: Optional[int]
+    work_preserved_ticks: int      # 被中止作业已执行、保留在账上的拍数
+    timeout_at: Optional[int]
+    note: str
+
+
 class System:
     def __init__(
         self,
@@ -214,6 +253,12 @@ class System:
         )
         self.trace: List[Segment] = []
         self.misses: List[MissRecord] = []
+
+        # 人工处置：预演（未确认不改变调度）与已确认处置记录
+        self.intervention_rehearsals: List[InterventionRehearsal] = []
+        self.intervention_records: List[InterventionRecord] = []
+        self._pending_timeouts: List[Dict] = []
+        self._next_rehearsal_id = 0
 
     # ------------------------------------------------------------ 承诺升级/撤回
 
@@ -344,7 +389,7 @@ class System:
         for _ in range(len(self.jobs) + 1):  # 迭代到不动点，覆盖传递阻塞
             changed = False
             for job in self.jobs:
-                if job.state == "done":
+                if job.state in ("done", "aborted"):
                     continue
                 want = 0
                 for res_name in job.held:
@@ -364,7 +409,8 @@ class System:
     def _job_commitments(self, job: Job) -> List[CriticalityCommitment]:
         """当前对该作业生效的升级承诺（同一任务可能被多条承诺升级）。"""
         return [c for c in self.active_commitments.values()
-                if c.task == job.task.name and job.state != "done"]
+                if c.task == job.task.name
+                and job.state not in ("done", "aborted")]
 
     def _job_crit_level(self, job: Optional[Job]) -> int:
         """作业的关键级别：静态优先级之上叠加有效承诺。
@@ -391,7 +437,7 @@ class System:
         # 级别同样沿继承传播，保证它等待的锁一定能被持有者放出。
         stack = [
             j for j in self.jobs
-            if j.state not in ("done", "deferred")
+            if j.state not in ("done", "aborted", "deferred")
             and j.blocked_on is not None
         ]
         seen = set()
@@ -435,7 +481,7 @@ class System:
         )
         protected = self._protected_holders()
         for job in self.jobs:
-            if job.state in ("done", "blocked"):
+            if job.state in ("done", "aborted", "blocked"):
                 continue
             if job.jid in protected:
                 # 持锁链上的持有者豁免延后：必须先把临界区跑完放锁
@@ -724,7 +770,7 @@ class System:
             target = next(
                 (j for j in self.jobs if j.jid == event.target_jid), None
             )
-            due = target is None or target.state == "done"
+            due = target is None or target.state in ("done", "aborted")
         if not due:
             return
         event.time = self.now if boundary is None else boundary
@@ -845,8 +891,9 @@ class System:
         # 拍边界：预排到此刻的升级/撤回在同一边界生效，
         # 与模式切换的先后按各自请求顺序独立保留（互不改写历史）
         self._apply_due_commitment_events()
+        self._apply_due_timeouts()
         for job in self.jobs:
-            if (not job.missed and job.state != "done"
+            if (not job.missed and job.state not in ("done", "aborted")
                     and self.now >= job.abs_deadline):
                 job.missed = True
                 self.misses.append(MissRecord(
@@ -983,6 +1030,262 @@ class System:
             ),
         }
 
+    # ------------------------------------------------------------ 人工处置预演
+
+    def _find_job(self, jid: int) -> Job:
+        job = next((j for j in self.jobs if j.jid == jid), None)
+        if job is None:
+            raise KeyError("unknown job: %r" % jid)
+        return job
+
+    def _preview_abort(self, job: Job) -> Dict:
+        """推演“中止该作业”的后果（只读，不改变任何调度状态）。
+
+        释放该作业持有的资源后，等待者沿持有-等待关系传递地解除阻塞；
+        已执行的工作量与已付开销保留在时间线上，不回滚。
+        """
+        released = list(job.held)
+        continuing = {job.jid}  # 被中止者视为“不再持有”，压力消失
+        waiters = []
+        still_deferred = []
+        changed = True
+        while changed:
+            changed = False
+            for other in self.jobs:
+                if other.jid in continuing or other.blocked_on is None:
+                    continue
+                if other.state in ("done", "aborted"):
+                    continue
+                res = self.resources.get(other.blocked_on)
+                if res is None:
+                    continue
+                holder = res["holder"]
+                if other.blocked_on in released or (
+                        holder is not None and holder.jid in continuing):
+                    continuing.add(other.jid)
+                    for held_name in other.held:
+                        if held_name not in released:
+                            released.append(held_name)
+                    if other.state == "deferred":
+                        still_deferred.append(other.jid)
+                    else:
+                        waiters.append(other.jid)
+                    changed = True
+        cycles = [
+            sorted(m["jid"] for m in c["members"])
+            for c in self.wait_cycles()
+            if any(m["jid"] == job.jid for m in c["members"])
+        ]
+        return {
+            "resources_released": list(job.held),
+            "all_resources_freed": released,
+            "work_preserved_ticks": job.task.wcet - job.remaining_work(),
+            "waiters_continuing": sorted(waiters),
+            "waiters_still_deferred": sorted(still_deferred),
+            "cycles_involving_job": cycles,
+            "explanation": (
+                "中止 %s#%d 将释放其持有的资源 %s；已执行的 %d 拍工作"
+                "与已付开销保留在时间线上不回滚；等待者 %s 可继续"
+                % (job.task.name, job.jid, list(job.held),
+                   job.task.wcet - job.remaining_work(),
+                   sorted(waiters) or "无")
+            ),
+        }
+
+    def rehearse_intervention(
+        self,
+        action: str,
+        jid: int,
+        timeout: Optional[int] = None,
+    ) -> InterventionRehearsal:
+        """登记一次人工处置预演；预演本身不改变当前调度。
+
+        action="abort"：目标作业须尚可撤销（未完成也未被中止）；
+        action="timeout"：目标作业须正在等待资源，确认后经过 timeout
+        拍仍等不到锁时放弃等待并中止。确认前可反复查看 preview。
+        """
+        if action not in ("abort", "timeout"):
+            raise ValueError("unknown intervention action: %r" % action)
+        job = self._find_job(jid)
+        if job.state in ("done", "aborted"):
+            raise ValueError(
+                "job %d 已结束（%s），无可撤销的工作" % (jid, job.state))
+        if action == "timeout":
+            if job.state != "blocked":
+                raise ValueError(
+                    "job %d 当前不在等待资源，无需设置等待超时" % jid)
+            if timeout is None or timeout <= 0:
+                raise ValueError("timeout 须为正整数拍")
+        preview = self._preview_abort(job)
+        if action == "timeout":
+            preview = dict(preview)
+            preview["would_fire_after"] = timeout
+            preview["explanation"] = (
+                "若 %s#%d 再等 %d 拍仍拿不到 %s，则放弃等待并中止："
+                % (job.task.name, job.jid, timeout, job.blocked_on)
+            ) + preview["explanation"]
+        rehearsal = InterventionRehearsal(
+            rid=self._next_rehearsal_id,
+            action=action,
+            jid=jid,
+            task=job.task.name,
+            created_at=self.now,
+            timeout=timeout if action == "timeout" else None,
+            preview=preview,
+        )
+        self._next_rehearsal_id += 1
+        self.intervention_rehearsals.append(rehearsal)
+        return rehearsal
+
+    def confirm_intervention(self, rid: int) -> InterventionRecord:
+        """确认一次预演并执行处置；重复确认返回同一记录，不重复释放。"""
+        rehearsal = next(
+            (r for r in self.intervention_rehearsals if r.rid == rid), None)
+        if rehearsal is None:
+            raise KeyError("unknown rehearsal: %r" % rid)
+        existing = next(
+            (r for r in self.intervention_records if r.rid == rid), None)
+        if existing is not None:
+            return existing  # 幂等：确认与重复确认不重复释放资源
+        job = self._find_job(rehearsal.jid)
+        if rehearsal.action == "abort":
+            record = self._apply_abort(rehearsal, job, self.now)
+        else:
+            # 等待超时：登记到点生效；到点时作业已不在等待则自然失效
+            fire_at = self.now + rehearsal.timeout
+            self._pending_timeouts.append(
+                {"rid": rehearsal.rid, "jid": job.jid, "fire_at": fire_at})
+            record = InterventionRecord(
+                rid=rehearsal.rid,
+                action="timeout",
+                jid=job.jid,
+                task=job.task.name,
+                confirmed_at=self.now,
+                applied_at=None,
+                resources_released=[],
+                waiters_unblocked=[],
+                aborted_jid=None,
+                work_preserved_ticks=(
+                    job.task.wcet - job.remaining_work()),
+                timeout_at=fire_at,
+                note="等待超时已设置：%d 拍后仍等待则中止"
+                     % rehearsal.timeout,
+            )
+        rehearsal.status = "confirmed"
+        self.intervention_records.append(record)
+        return record
+
+    def _apply_abort(self, rehearsal, job, at_time) -> InterventionRecord:
+        preserved = job.task.wcet - job.remaining_work()
+        released, unblocked = self._abort_job(job)
+        return InterventionRecord(
+            rid=rehearsal.rid,
+            action=rehearsal.action,
+            jid=job.jid,
+            task=job.task.name,
+            confirmed_at=self.now,
+            applied_at=at_time,
+            resources_released=released,
+            waiters_unblocked=unblocked,
+            aborted_jid=job.jid,
+            work_preserved_ticks=preserved,
+            timeout_at=None,
+            note="已中止 %s#%d，释放 %s；已执行 %d 拍保留在账上"
+                 % (job.task.name, job.jid, released or "无资源", preserved),
+        )
+
+    def _abort_job(self, job: Job):
+        """中止作业：取消挂起的锁请求、释放持有资源并唤醒等待者。
+
+        已执行的 run 拍与已付开销留在时间线上（trace 不改写）；
+        被让步延后的等待者保持延后，不参与本次抢锁。
+        """
+        released = list(job.held)
+        unblocked = []
+        if job.blocked_on is not None:
+            res = self.resources.get(job.blocked_on)
+            if res is not None and job in res["waiters"]:
+                res["waiters"].remove(job)
+            job.blocked_on = None
+        for res_name in list(job.held):
+            res = self.resources[res_name]
+            if res["holder"] is not job:
+                job.held.remove(res_name)
+                continue
+            res["holder"] = None
+            job.held.remove(res_name)
+            self._finish_lock_budget(res, self.now)
+            res["acquired_at"] = None
+            res["mode"] = None
+            res["budget"] = None
+            for w in list(res["waiters"]):
+                if w.state == "deferred":
+                    pass  # 仍处于让步延后：不参与本次抢锁
+                else:
+                    w.state = "ready"
+                    unblocked.append(w.jid)
+                w.blocked_on = None
+            res["waiters"].clear()
+        job.state = "aborted"
+        job.boost = 0
+        job.deferred_by_sources.clear()
+        if self.current is job:
+            self.current = None
+        if self._switch_to is job:
+            self._switch_to = None
+            self._switch_left = 0
+        self._recompute_boosts()
+        self._recompute_deferrals()
+        return released, unblocked
+
+    def _apply_due_timeouts(self):
+        due = [t for t in self._pending_timeouts
+               if t["fire_at"] <= self.now]
+        if not due:
+            return
+        self._pending_timeouts = [
+            t for t in self._pending_timeouts if t["fire_at"] > self.now]
+        for pending in due:
+            record = next(
+                (r for r in self.intervention_records
+                 if r.rid == pending["rid"]), None)
+            rehearsal = next(
+                (r for r in self.intervention_rehearsals
+                 if r.rid == pending["rid"]), None)
+            job = self._find_job(pending["jid"])
+            if job.state == "blocked":
+                # 到点仍等不到锁：放弃等待并中止，释放其持有资源
+                applied = self._apply_abort(rehearsal, job, self.now)
+                if record is not None:
+                    record.applied_at = applied.applied_at
+                    record.resources_released = applied.resources_released
+                    record.waiters_unblocked = applied.waiters_unblocked
+                    record.aborted_jid = applied.aborted_jid
+                    record.note = ("等待超时到达，%s" % applied.note)
+            else:
+                if rehearsal is not None:
+                    rehearsal.status = "expired"
+                if record is not None:
+                    record.note = ("超时到达时作业已不在等待"
+                                   "（状态 %s），未产生中止" % job.state)
+
+    def pending_interventions(self) -> List[Dict]:
+        """仍未确认的预演；保存重开后依旧挂起，仍需人工确认。"""
+        result = []
+        for r in self.intervention_rehearsals:
+            if r.status != "pending":
+                continue
+            result.append({
+                "rid": r.rid,
+                "action": r.action,
+                "jid": r.jid,
+                "task": r.task,
+                "created_at": r.created_at,
+                "timeout": r.timeout,
+                "preview": r.preview,
+            })
+        return result
+
     def run_report(self) -> Dict:
         """把正常完成、无法解除的等待与错误事件分开汇报。"""
         return {
@@ -991,7 +1294,21 @@ class System:
                  "completed_at": j.completed_at}
                 for j in self.jobs if j.state == "done"
             ],
+            "aborted": [
+                {"jid": j.jid, "task": j.task.name,
+                 "executed_ticks": j.task.wcet - j.remaining_work()}
+                for j in self.jobs if j.state == "aborted"
+            ],
             "unresolvable_waits": self.wait_cycles(),
+            "interventions": [
+                {"rid": r.rid, "action": r.action, "jid": r.jid,
+                 "task": r.task, "confirmed_at": r.confirmed_at,
+                 "applied_at": r.applied_at,
+                 "resources_released": list(r.resources_released),
+                 "waiters_unblocked": list(r.waiters_unblocked),
+                 "note": r.note}
+                for r in self.intervention_records
+            ],
             "errors": {
                 "missed_deadlines": [
                     {"jid": m.jid, "task": m.task,
