@@ -17,20 +17,30 @@ from .system import Job, MissRecord, System
 
 
 def _job_deferred_intervals(sys: System, job: Job):
-    """由让步事件还原该作业处于延后态的 [t0, t1) 区间列表。"""
-    intervals = []
+    """由让步事件还原该作业处于延后态的 [t0, t1) 区间列表。
+
+    同一作业可能被多条承诺来源同时延后（每条来源一个事件），
+    因此先合并重叠/相邻区间，避免重复计拍。
+    """
+    raw = []
     open_at = None
     for e in sys.concession_events:
         if e.jid != job.jid:
             continue
         if e.resumed_at is not None:
-            intervals.append((e.time, e.resumed_at))
+            raw.append((e.time, e.resumed_at))
         else:
             end = sys.now
             state = next((j.state for j in sys.jobs
                           if j.jid == job.jid), None)
             if state == "deferred":
-                intervals.append((e.time, end))
+                raw.append((e.time, end))
+    intervals = []
+    for a, b in sorted(raw):
+        if intervals and a <= intervals[-1][1]:
+            intervals[-1] = (intervals[-1][0], max(intervals[-1][1], b))
+        else:
+            intervals.append((a, b))
     return intervals
 
 

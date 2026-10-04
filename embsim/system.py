@@ -437,20 +437,32 @@ class System:
         for job in self.jobs:
             if job.state in ("done", "blocked"):
                 continue
-            commitment = self._deferring_commitment_for(job, deferring,
-                                                        top_level)
-            if commitment is not None and job.jid not in protected:
-                self._defer_job(job, commitment, protected)
-            elif job.state == "deferred" and (
-                    job.jid in protected or commitment is None):
-                reason = (
-                    "作业持有升级任务正在等待的锁，先完成临界区放锁"
-                    if job.jid in protected else "承诺撤回或关键级别不再占优"
-                )
-                self._resume_job(job, reason)
+            if job.jid in protected:
+                # 持锁链上的持有者豁免延后：必须先把临界区跑完放锁
+                if job.state == "deferred":
+                    self._resume_job(
+                        job, "作业持有升级任务正在等待的锁，先完成临界区放锁")
+                continue
+            sources = self._deferring_commitments_for(job, deferring,
+                                                      top_level)
+            valid = {c.name for c in sources}
+            if job.state == "deferred":
+                # 逐条核对既有来源：撤回一个来源不影响其他仍有效来源
+                for name in list(job.deferred_by_sources):
+                    if name not in valid:
+                        self._remove_deferral_source(
+                            job, name, "承诺撤回或关键级别不再占优")
+                for c in sources:
+                    if c.name not in job.deferred_by_sources:
+                        self._add_deferral_source(job, c)
+                # 全部来源消失后才恢复原调度约束
+                if not job.deferred_by_sources:
+                    self._resume_job(job, "承诺撤回或关键级别不再占优")
+            elif sources:
+                self._defer_job(job, sources)
 
-    def _deferring_commitment_for(self, job, deferring, top_level):
-        """返回要求该作业让步的承诺（取提出最早者），无则 None。"""
+    def _deferring_commitments_for(self, job, deferring, top_level):
+        """返回当前要求该作业让步的全部承诺（按提出先后排序）。"""
         candidates = []
         job_level = self._job_crit_level(job)
         for c in deferring:
@@ -463,7 +475,7 @@ class System:
                 continue
             candidates.append(c)
         if not candidates:
-            return None
+            return []
         candidates.sort(
             key=lambda c: next(
                 (e.seq for e in self.commitment_events[::-1]
@@ -471,17 +483,32 @@ class System:
                 10**18,
             )
         )
-        return candidates[0]
+        return candidates
 
-    def _defer_job(self, job: Job, commitment: CriticalityCommitment,
-                   protected: set):
-        if job.state == "deferred" and job.deferred_by == commitment.name:
-            return
+    def _defer_job(self, job: Job,
+                   commitments: List[CriticalityCommitment]):
         if job.state == "deferred":
+            for c in commitments:
+                if c.name not in job.deferred_by_sources:
+                    self._add_deferral_source(job, c)
             return
         if self.current is job and job.state == "running":
             job.state = "ready"
             self.current = None
+        job.state = "deferred"
+        for c in commitments:
+            self._add_deferral_source(job, c)
+        # 若正在切换到该作业的路上，取消目标（已付的切换开销留在时间线上）
+        if self._switch_to is job:
+            self._switch_to = None
+            self._switch_left = 0
+
+    def _add_deferral_source(self, job: Job,
+                             commitment: CriticalityCommitment):
+        """登记一条新的延后来源；已执行进度与已占有资源原样保留。"""
+        if commitment.name in job.deferred_by_sources:
+            return
+        job.deferred_by_sources.append(commitment.name)
         reason = (
             "关键级别 %d 低于升级任务 %s 的承诺级别 %d，按 %s 策略延后；"
             "已执行进度与已占有资源保留"
@@ -492,12 +519,6 @@ class System:
                 commitment.strategy,
             )
         )
-        job.state = "deferred"
-        job.deferred_by = commitment.name
-        # 若正在切换到该作业的路上，取消目标（已付的切换开销留在时间线上）
-        if self._switch_to is job:
-            self._switch_to = None
-            self._switch_left = 0
         self.concession_events.append(ConcessionEvent(
             time=self.now,
             jid=job.jid,
@@ -508,18 +529,28 @@ class System:
             reason=reason,
         ))
 
-    def _resume_job(self, job: Job, reason: str):
-        commitment_name = job.deferred_by
+    def _remove_deferral_source(self, job: Job, name: str, reason: str):
+        """撤销一条延后来源；其余仍有效来源继续生效。"""
+        if name in job.deferred_by_sources:
+            job.deferred_by_sources.remove(name)
         event = next(
             (e for e in reversed(self.concession_events)
-             if e.jid == job.jid and e.resumed_at is None),
+             if e.jid == job.jid and e.commitment == name
+             and e.resumed_at is None),
             None,
         )
         if event is not None:
             event.resumed_at = self.now
             event.resume_reason = reason
+
+    def _resume_job(self, job: Job, reason: str):
+        for event in self.concession_events:
+            if event.jid != job.jid or event.resumed_at is not None:
+                continue
+            event.resumed_at = self.now
+            event.resume_reason = reason
+        job.deferred_by_sources.clear()
         job.state = "ready"
-        job.deferred_by = None
 
     # ------------------------------------------------------------ 资源操作
 
@@ -868,6 +899,7 @@ class System:
                 "task": job.task.name,
                 "deferred_at": event.time if event else None,
                 "commitment": job.deferred_by,
+                "sources": list(job.deferred_by_sources),
                 "commitment_task": spec.task if spec else None,
                 "strategy": spec.strategy if spec else None,
                 "reason": event.reason if event else None,
@@ -875,6 +907,107 @@ class System:
                 "held_resources": list(job.held),
             })
         return result
+
+    # ------------------------------------------------------------ 等待环与汇报
+
+    def wait_for_graph(self) -> Dict[int, Dict]:
+        """当前真实的持有-等待关系（保留持锁事实，不做优先级美化）。
+
+        返回 {等待者 jid: {"task", "holds", "waits_on", "holders"}}，
+        只包含至少等待一把他人持有资源的未完成作业。
+        """
+        graph = {}
+        for res in self.resources.values():
+            holder = res["holder"]
+            if holder is None:
+                continue
+            for w in res["waiters"]:
+                if w.state == "done":
+                    continue
+                entry = graph.setdefault(w.jid, {
+                    "jid": w.jid,
+                    "task": w.task.name,
+                    "holds": list(w.held),
+                    "waits_on": [],
+                    "holders": [],
+                })
+                entry["waits_on"].append(res["name"])
+                entry["holders"].append(holder.jid)
+        return graph
+
+    def wait_cycles(self) -> List[Dict]:
+        """检测持有-等待关系中的真实资源环（循环等待）。
+
+        环上每个作业都持有环内下一作业正在等待的资源。优先级继承
+        只能调整执行先后，无法打破循环等待，因此环上的阻塞无法仅靠
+        优先级解决；不在环上的独立作业不受拖累，仍按原约束调度。
+        """
+        graph = self.wait_for_graph()
+        edges = {jid: set(e["holders"]) for jid, e in graph.items()}
+        cycles = []
+        reported = set()
+        for start in edges:
+            stack = [(start, [start])]
+            while stack:
+                node, path = stack.pop()
+                for nxt in edges.get(node, ()):
+                    if nxt == start and len(path) > 1:
+                        key = frozenset(path)
+                        if key not in reported:
+                            reported.add(key)
+                            cycles.append(self._describe_cycle(path, graph))
+                    elif nxt in edges and nxt not in path:
+                        stack.append((nxt, path + [nxt]))
+        return cycles
+
+    def _describe_cycle(self, path: List[int], graph: Dict) -> Dict:
+        jobs = {j.jid: j for j in self.jobs}
+        members = []
+        for jid in path:
+            job = jobs[jid]
+            entry = graph.get(jid, {})
+            members.append({
+                "jid": jid,
+                "task": job.task.name,
+                "holds": list(job.held),
+                "waits_on": list(entry.get("waits_on", [])),
+                "remaining_work": job.remaining_work(),
+            })
+        return {
+            "members": members,
+            "tasks": [m["task"] for m in members],
+            "explanation": (
+                "循环等待：环上每个作业都持有下一作业所需的资源，"
+                "优先级继承无法解除该等待，需要超时、中止或资源有序化"
+                "等外部手段介入"
+            ),
+        }
+
+    def run_report(self) -> Dict:
+        """把正常完成、无法解除的等待与错误事件分开汇报。"""
+        return {
+            "completed": [
+                {"jid": j.jid, "task": j.task.name,
+                 "completed_at": j.completed_at}
+                for j in self.jobs if j.state == "done"
+            ],
+            "unresolvable_waits": self.wait_cycles(),
+            "errors": {
+                "missed_deadlines": [
+                    {"jid": m.jid, "task": m.task,
+                     "deadline": m.deadline,
+                     "remaining_work": m.remaining_work}
+                    for m in self.misses
+                ],
+                "lock_budget_violations": [
+                    {"resource": v.resource, "jid": v.jid,
+                     "task": v.task, "mode": v.mode,
+                     "first_violation_at": v.first_violation_at,
+                     "overrun": v.overrun}
+                    for v in self.lock_budget_violations
+                ],
+            },
+        }
 
     def compare_concessions(
         self,

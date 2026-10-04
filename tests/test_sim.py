@@ -842,5 +842,229 @@ class TestCriticalityEscalation(unittest.TestCase):
         self.assertIsNotNone(tasks["L"]["deferred_at"])
 
 
+class TestMultiSourceDeferralAndCycles(unittest.TestCase):
+    """多来源让步、嵌套等待链分别撤回、真实资源环与分类汇报。"""
+
+    def test_snapshot_resume_with_new_workload_and_timing(self):
+        """改变工作量与升级时刻：连续运行 vs 中途保存重开逐拍一致。"""
+        def build():
+            s = System(
+                tasks=[
+                    TaskSpec("X", 1,
+                             [run(2), lock("R"), run(2), unlock("R"), run(1)],
+                             period=50),
+                    TaskSpec("Y", 2, [run(3)], period=50, offset=2),
+                    TaskSpec("Z", 3,
+                             [run(1), lock("R"), run(1), unlock("R")],
+                             period=50, offset=5, deadline=40),
+                ],
+                costs=Costs(context_switch=0, lock=1, unlock=1),
+            )
+            s.escalate(
+                CriticalityCommitment("cz", "Z", priority=6,
+                                      deadline=10, strategy="defer"),
+                at_time=5,
+            )
+            s.withdraw("cz", at_time=14)
+            return s
+
+        whole = build()
+        whole.run_until(24)
+        part = build()
+        part.run_until(10)
+        reopened = System.restore(part.snapshot())
+        reopened.run_until(24)
+
+        self.assertEqual(segs(whole), segs(reopened))
+        self.assertEqual(
+            [(e.time, e.seq, e.kind, e.name) for e in whole.commitment_events],
+            [(e.time, e.seq, e.kind, e.name)
+             for e in reopened.commitment_events],
+        )
+        self.assertEqual(
+            [(c.time, c.task, c.jid, c.commitment, c.resumed_at)
+             for c in whole.concession_events],
+            [(c.time, c.task, c.jid, c.commitment, c.resumed_at)
+             for c in reopened.concession_events],
+        )
+        # 临时承诺数量：一次升级 + 一次撤回，结束后无生效承诺
+        self.assertEqual(len(whole.commitment_events), 2)
+        self.assertEqual(whole.active_commitments, {})
+        # 让步确实发生过（不是跳过让步路径）
+        self.assertTrue(whole.concession_events)
+
+    def _build_chain(self):
+        """L 持 Q；M 持 R 等 Q；H 等 R：三层等待链。"""
+        return System(
+            tasks=[
+                TaskSpec("L", 1, [lock("Q"), run(2), unlock("Q")],
+                         period=100),
+                TaskSpec("M", 2,
+                         [lock("R"), run(1), lock("Q"), run(1),
+                          unlock("Q"), unlock("R")],
+                         period=100, offset=2),
+                TaskSpec("H", 3,
+                         [run(1), lock("R"), run(1), unlock("R")],
+                         period=100, offset=4, deadline=60),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+        )
+
+    def test_withdraw_outer_request_restores_constraints(self):
+        """撤回外层（H 的）升级请求：链上保护解除，继承压力回落。"""
+        sys_ = self._build_chain()
+        sys_.escalate(
+            CriticalityCommitment("outer", "H", priority=8,
+                                  strategy="defer"),
+            at_time=6,
+        )
+        sys_.run_until(7)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        # H 等 R、M 等 Q：持锁链上的 M、L 都被豁免，先把锁放出
+        self.assertNotEqual(jobs["M"].state, "deferred")
+        self.assertNotEqual(jobs["L"].state, "deferred")
+        # 升级后的关键级别沿等待链传播到最底层持有者
+        self.assertEqual(sys_._job_crit_level(jobs["L"]), 8)
+        self.assertEqual(sys_._job_crit_level(jobs["M"]), 8)
+
+        sys_.withdraw("outer", at_time=7)
+        sys_.run_until(8)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        # 撤回后只剩普通优先级继承：L 借到 H 的静态级别 3
+        self.assertEqual(sys_._job_crit_level(jobs["L"]), 3)
+        self.assertEqual(
+            [(e.kind, e.name) for e in sys_.commitment_events],
+            [("escalate", "outer"), ("withdraw", "outer")],
+        )
+        # 链最终解开，全部作业正常完成，已完成工作不回滚
+        sys_.run_until(20)
+        self.assertTrue(all(j.state == "done" for j in sys_.jobs))
+
+    def test_withdraw_inner_request_restores_constraints(self):
+        """撤回内层（M 的）升级请求：底层持有者失去升级压力。"""
+        sys_ = self._build_chain()
+        sys_.escalate(
+            CriticalityCommitment("inner", "M", priority=7,
+                                  strategy="defer"),
+            at_time=6,
+        )
+        sys_.run_until(7)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        # M 等 Q：L 在持锁链上被豁免；M 自身是承诺目标不被延后
+        self.assertNotEqual(jobs["L"].state, "deferred")
+        self.assertEqual(sys_._job_crit_level(jobs["L"]), 7)
+
+        sys_.withdraw("inner", at_time=7)
+        sys_.run_until(8)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        # 内层请求消失后恢复普通继承（H 经 M 传下来的级别 3）
+        self.assertEqual(sys_._job_crit_level(jobs["L"]), 3)
+        sys_.run_until(20)
+        self.assertTrue(all(j.state == "done" for j in sys_.jobs))
+
+    def test_shared_sources_withdraw_one_keeps_others(self):
+        """共享来源：两个承诺同时延后同一作业，分别撤回。"""
+        sys_ = System(
+            tasks=[
+                TaskSpec("A", 1, [run(20)], period=100),
+                TaskSpec("B", 3, [run(2)], period=100, offset=2),
+                TaskSpec("C", 4, [run(2)], period=100, offset=3),
+            ],
+            costs=Costs(context_switch=0),
+        )
+        sys_.escalate(CriticalityCommitment("cB", "B", priority=8,
+                                            strategy="defer"),
+                      at_time=2)
+        sys_.escalate(CriticalityCommitment("cC", "C", priority=9,
+                                            strategy="defer"),
+                      at_time=3)
+        sys_.run_until(5)
+        a = next(j for j in sys_.jobs if j.task.name == "A")
+        # A 已执行 [0,2) 两拍，延后不清零；两个来源都登记在案
+        self.assertEqual(a.state, "deferred")
+        self.assertEqual(a.deferred_by_sources, ["cB", "cC"])
+        self.assertEqual(a.deferred_by, "cB")
+        self.assertEqual(a.remaining_work(), 18)
+
+        # 撤回一个来源：另一个仍有效，让步继续
+        sys_.withdraw("cB", at_time=10)
+        sys_.run_until(11)
+        self.assertEqual(a.state, "deferred")
+        self.assertEqual(a.deferred_by_sources, ["cC"])
+
+        # 全部来源消失后才恢复原调度约束
+        sys_.withdraw("cC", at_time=12)
+        sys_.run_until(13)
+        self.assertEqual(a.state, "ready")
+        self.assertEqual(a.deferred_by_sources, [])
+        self.assertIsNone(a.deferred_by)
+        sys_.run_until(32)
+        # 已完成工作不回滚：A 恢复后 B 先补完被 cC 延后的最后 1 拍，
+        # A 再在 [13,31) 补完剩余 18 拍
+        self.assertEqual(a.completed_at, 31)
+        events = [e for e in sys_.concession_events if e.jid == a.jid]
+        self.assertEqual(
+            [(e.commitment, e.time, e.resumed_at) for e in events],
+            [("cB", 2, 10), ("cC", 3, 12)],
+        )
+
+    def test_real_resource_cycle_reported_separately(self):
+        """真实资源环：保留持有关系、说明优先级无法解决、独立任务不受拖累。"""
+        sys_ = System(
+            tasks=[
+                TaskSpec("A", 2,
+                         [lock("P"), run(1), lock("Q"), run(1),
+                          unlock("Q"), unlock("P")],
+                         period=100),
+                TaskSpec("B", 3,
+                         [lock("Q"), run(1), lock("P"), run(1),
+                          unlock("P"), unlock("Q")],
+                         period=100, offset=1),
+                TaskSpec("D", 1, [run(3)], period=100),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+        )
+        # 临时承诺照常建立与撤回（inherit_only，不干扰环的形成）
+        sys_.escalate(CriticalityCommitment("cd", "D",
+                                            strategy="inherit_only"),
+                      at_time=0)
+        sys_.withdraw("cd", at_time=6)
+        sys_.run_until(12)
+
+        jobs = {j.task.name: j for j in sys_.jobs}
+        # 环上双方互相持有对方所需资源，永久阻塞；已完成工作保留
+        self.assertEqual(jobs["A"].state, "blocked")
+        self.assertEqual(jobs["B"].state, "blocked")
+        self.assertEqual(jobs["A"].held, ["P"])
+        self.assertEqual(jobs["B"].held, ["Q"])
+        self.assertEqual(jobs["A"].remaining_work(), 1)
+        self.assertEqual(jobs["B"].remaining_work(), 1)
+        # 独立任务 D 不受无关环拖累，正常完成
+        self.assertEqual(jobs["D"].state, "done")
+        self.assertEqual(jobs["D"].completed_at, 9)
+
+        # 等待环：任务身份与真实持有关系
+        cycles = sys_.wait_cycles()
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(sorted(cycles[0]["tasks"]), ["A", "B"])
+        holds = {m["task"]: m["holds"] for m in cycles[0]["members"]}
+        self.assertEqual(holds, {"A": ["P"], "B": ["Q"]})
+        self.assertIn("优先级", cycles[0]["explanation"])
+
+        # 正常完成、无法解除的等待、错误分别报告
+        report = sys_.run_report()
+        self.assertEqual([c["task"] for c in report["completed"]], ["D"])
+        self.assertEqual(len(report["unresolvable_waits"]), 1)
+        self.assertEqual(report["errors"],
+                         {"missed_deadlines": [],
+                          "lock_budget_violations": []})
+        # 临时承诺数量：一次升级一次撤回，无残留
+        self.assertEqual(len(sys_.commitment_events), 2)
+        self.assertEqual(sys_.active_commitments, {})
+        # 原有调度入口仍可用
+        sys_.run(2)
+        self.assertEqual(sys_.now, 14)
+
+
 if __name__ == "__main__":
     unittest.main()
