@@ -842,5 +842,185 @@ class TestCriticalityEscalation(unittest.TestCase):
         self.assertIsNotNone(tasks["L"]["deferred_at"])
 
 
+class TestConcessionRegression(unittest.TestCase):
+    """让步状态迁移回归：多来源延后、嵌套等待、断点续跑与资源环。
+
+    新输入（与上一组不同的工作量与升级时刻）：
+    L(优先级1)：lock R, run4, unlock R, run3
+    M(优先级2)：run2，offset=1
+    H(优先级3)：run2, lock R, run1, unlock R，offset=5，截止40
+    t=5 升级 H 到关键级别 5（defer，新作业相对截止 25），t=15 撤回。
+    """
+
+    def build(self):
+        sys_ = System(
+            tasks=[
+                TaskSpec("L", 1,
+                         [lock("R"), run(4), unlock("R"), run(3)],
+                         period=100),
+                TaskSpec("M", 2, [run(2)], period=100, offset=1),
+                TaskSpec("H", 3,
+                         [run(2), lock("R"), run(1), unlock("R")],
+                         period=100, offset=5, deadline=40),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+        )
+        sys_.escalate(
+            CriticalityCommitment("c1", "H", priority=5,
+                                  deadline=25, strategy="defer"),
+            at_time=5,
+        )
+        sys_.withdraw("c1", at_time=15)
+        return sys_
+
+    def test_continuous_vs_snapshot_resume_same_axis(self):
+        whole = self.build()
+        whole.run_until(24)
+
+        part = self.build()
+        part.run_until(10)
+        reopened = System.restore(part.snapshot())
+        reopened.run_until(24)
+
+        # 调度轴逐段一致
+        self.assertEqual(segs(whole), segs(reopened))
+        # 任务身份与完成工作一致（已完成工作不回滚）
+        self.assertEqual(
+            {j.jid: (j.task.name, j.completed_at) for j in whole.jobs},
+            {0: ("L", 18), 1: ("M", 3), 2: ("H", 14)},
+        )
+        self.assertEqual(
+            {j.jid: (j.task.name, j.completed_at) for j in reopened.jobs},
+            {j.jid: (j.task.name, j.completed_at) for j in whole.jobs},
+        )
+        # 临时承诺事件数量与内容一致
+        self.assertEqual(
+            [(e.time, e.kind, e.name) for e in whole.commitment_events],
+            [(5, "escalate", "c1"), (15, "withdraw", "c1")],
+        )
+        self.assertEqual(
+            [(e.time, e.kind, e.name) for e in reopened.commitment_events],
+            [(e.time, e.kind, e.name) for e in whole.commitment_events],
+        )
+        self.assertEqual(len(whole.concession_events), 2)
+        self.assertEqual(
+            [(c.time, c.task, c.resumed_at)
+             for c in reopened.concession_events],
+            [(c.time, c.task, c.resumed_at)
+             for c in whole.concession_events],
+        )
+
+    def test_shared_and_nested_sources_withdrawn_independently(self):
+        """多层等待链 + 共享来源：外层/内层/共享依据可分别撤销。"""
+        sys_ = System(
+            tasks=[
+                TaskSpec("L", 1, [lock("Q"), run(3), unlock("Q")],
+                         period=100),
+                TaskSpec("M", 2,
+                         [lock("R"), run(1), lock("Q"), run(1),
+                          unlock("Q"), unlock("R")],
+                         period=100, offset=1),
+                TaskSpec("H", 3,
+                         [run(1), lock("R"), run(1), unlock("R")],
+                         period=100, offset=2, deadline=60),
+                TaskSpec("X", 1, [run(6)], period=100, offset=1),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+        )
+        sys_.escalate(
+            CriticalityCommitment("c_outer", "H", priority=6,
+                                  strategy="defer"), at_time=3,
+        )
+        sys_.escalate(
+            CriticalityCommitment("c_inner", "M", priority=5,
+                                  strategy="defer"), at_time=3,
+        )
+        sys_.run_until(6)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        # 多层等待链 H->R(M)->Q(L)：持锁的 M、L 受保护不被延后
+        self.assertEqual(jobs["L"].held, ["Q"])
+        self.assertEqual(jobs["M"].held, ["R"])
+        self.assertEqual(jobs["M"].blocked_on, "Q")
+        self.assertEqual(jobs["H"].blocked_on, "R")
+        self.assertNotEqual(jobs["L"].state, "deferred")
+        self.assertNotEqual(jobs["M"].state, "deferred")
+        # X 与两条承诺都无关：被两个来源共同延后
+        self.assertEqual(jobs["X"].state, "deferred")
+        self.assertEqual(set(jobs["X"].deferred_by_sources),
+                         {"c_outer", "c_inner"})
+
+        # 撤回外层请求：共享来源 c_inner 继续生效，X 仍被延后
+        sys_.withdraw("c_outer", at_time=6)
+        sys_.run_until(7)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        self.assertEqual(jobs["X"].state, "deferred")
+        self.assertEqual(jobs["X"].deferred_by_sources, ["c_inner"])
+        self.assertEqual(jobs["X"].deferred_by, "c_inner")
+
+        # 撤回内层请求：全部来源消失，X 恢复调度资格
+        sys_.withdraw("c_inner", at_time=8)
+        sys_.run_until(9)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        self.assertEqual(jobs["X"].state, "ready")
+        self.assertEqual(jobs["X"].deferred_by_sources, [])
+        self.assertIsNone(jobs["X"].deferred_by)
+
+        # 全部承诺消失后恢复原调度约束，所有作业正常完成
+        sys_.run_until(40)
+        self.assertTrue(all(j.state == "done" for j in sys_.jobs))
+        self.assertEqual(sys_.unresolvable_waits(), [])
+
+    def test_resource_cycle_reported_without_blocking_others(self):
+        """真实资源环：A 持 R1 等 R2，B 持 R2 等 R1；独立任务不受拖累。"""
+        sys_ = System(
+            tasks=[
+                TaskSpec("A", 2,
+                         [lock("R1"), lock("R2"), run(1),
+                          unlock("R2"), unlock("R1")],
+                         period=100),
+                TaskSpec("B", 3,
+                         [lock("R2"), lock("R1"), run(1),
+                          unlock("R1"), unlock("R2")],
+                         period=100, offset=1),
+                TaskSpec("C", 1, [run(3)], period=100),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+        )
+        sys_.run_until(12)
+        jobs = {j.task.name: j for j in sys_.jobs}
+        # 环上双方保持真实持有关系，均阻塞
+        self.assertEqual(jobs["A"].state, "blocked")
+        self.assertEqual(jobs["A"].held, ["R1"])
+        self.assertEqual(jobs["A"].blocked_on, "R2")
+        self.assertEqual(jobs["B"].state, "blocked")
+        self.assertEqual(jobs["B"].held, ["R2"])
+        self.assertEqual(jobs["B"].blocked_on, "R1")
+        # 独立任务 C 不受无关环拖累，正常完成
+        self.assertEqual(jobs["C"].state, "done")
+        self.assertEqual(jobs["C"].completed_at, 7)
+        # 无法解除的等待单独报告，并说明优先级继承无能为力
+        cycles = sys_.unresolvable_waits()
+        self.assertEqual(len(cycles), 1)
+        members = {m["task"] for m in cycles[0]["jobs"]}
+        self.assertEqual(members, {"A", "B"})
+        self.assertIn("优先级继承", cycles[0]["explanation"])
+        self.assertIn("R1", cycles[0]["explanation"])
+
+    def test_errors_waits_and_completion_reported_separately(self):
+        sys_ = self.build()
+        # 错误：未知承诺/未知任务立即抛错，不污染调度轴
+        with self.assertRaises(KeyError):
+            sys_.withdraw("nonexistent")
+        with self.assertRaises(KeyError):
+            sys_.escalate(CriticalityCommitment("bad", "NOPE"))
+        sys_.run_until(24)
+        # 正常完成：完成时刻按任务身份逐项可查
+        done = {j.task.name: j.completed_at for j in sys_.jobs}
+        self.assertEqual(done, {"L": 18, "M": 3, "H": 14})
+        # 本场景没有无法解除的等待
+        self.assertEqual(sys_.unresolvable_waits(), [])
+        self.assertEqual(sys_.pending_deferrals(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
