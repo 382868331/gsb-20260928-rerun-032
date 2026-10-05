@@ -1008,6 +1008,123 @@ class TestMultiSourceDeferralAndCycles(unittest.TestCase):
             [("cB", 2, 10), ("cC", 3, 12)],
         )
 
+
+def manual_cycle_system():
+    return System(
+        tasks=[
+            TaskSpec("A", 2,
+                     [lock("P"), run(1), lock("Q"), run(1),
+                      unlock("Q"), unlock("P")],
+                     period=100),
+            TaskSpec("B", 3,
+                     [lock("Q"), run(1), lock("P"), run(1),
+                      unlock("P"), unlock("Q")],
+                     period=100, offset=1),
+            TaskSpec("D", 1, [run(10)], period=100),
+            TaskSpec("X", 1, [run(1)], period=100, offset=20),
+        ],
+        costs=Costs(context_switch=0, lock=1, unlock=1),
+    )
+
+
+class TestManualCycleIntervention(unittest.TestCase):
+    def test_preview_does_not_change_schedule_and_abort_is_confirmed(self):
+        sys_ = manual_cycle_system()
+        sys_.escalate(CriticalityCommitment("cD", "D", priority=8,
+                                            strategy="defer"),
+                      at_time=6)
+        sys_.escalate(CriticalityCommitment("cX", "X", priority=9,
+                                            strategy="defer"),
+                      at_time=6)
+        sys_.run_until(6)
+        a = next(j for j in sys_.jobs if j.task.name == "A")
+        b = next(j for j in sys_.jobs if j.task.name == "B")
+
+        preview = sys_.prepare_resource_cycle_intervention(
+            a.jid, action="abort", intervention_id="abort-a")
+        self.assertEqual(preview["resources_released"], ["P"])
+        self.assertEqual(preview["completed_work_preserved"]["executed_work"], 1)
+        self.assertEqual(preview["completed_work_preserved"]["remaining_work"], 1)
+        self.assertEqual(preview["affected_jobs"], [a.jid, b.jid])
+
+        # 预演不改变当前调度：环、持有资源和时钟仍保持确认前状态
+        self.assertEqual(sys_.now, 6)
+        self.assertEqual(a.state, "blocked")
+        self.assertEqual(b.state, "blocked")
+        self.assertEqual(a.held, ["P"])
+        self.assertEqual(sys_.manual_intervention_history(), [])
+
+        # 未确认预演保存重开后仍是未确认状态，不会自动处置
+        reopened = System.restore(sys_.snapshot())
+        pending = reopened.pending_resource_cycle_interventions()
+        self.assertEqual(len(pending), 1)
+        self.assertFalse(pending[0]["confirmed"])
+        self.assertEqual(pending[0]["status"], "unconfirmed")
+
+        reopened.confirm_resource_cycle_intervention("abort-a")
+        reopened_b = next(j for j in reopened.jobs if j.task.name == "B")
+        reopened_a = next(j for j in reopened.jobs if j.task.name == "A")
+        self.assertEqual(reopened_a.state, "aborted")
+        self.assertEqual(reopened_a.held, [])
+        self.assertEqual(reopened_a.remaining_work(), 1)
+        self.assertIsNone(reopened.resources["P"]["holder"])
+        self.assertEqual(reopened.resources["P"]["waiters"], [])
+        self.assertEqual(reopened.resources["Q"]["waiters"], [])
+        self.assertEqual(reopened.wait_for_graph(), {})
+        self.assertEqual(reopened_b.state, "deferred")
+        self.assertEqual(reopened_b.deferred_by_sources, ["cD", "cX"])
+
+        # 人工处置不清空多条临时承诺依据；撤一条仍受另一条约束
+        reopened.withdraw("cD", at_time=7)
+        reopened.run_until(8)
+        self.assertEqual(reopened_b.state, "deferred")
+        self.assertEqual(reopened_b.deferred_by_sources, ["cX"])
+        reopened.withdraw("cX", at_time=8)
+        reopened.run_until(12)
+        self.assertEqual(reopened_b.state, "done")
+
+        # 重复确认不重复释放资源；审计记录可追溯实际作业和资源
+        again = reopened.confirm_resource_cycle_intervention("abort-a")
+        self.assertEqual(again["resources_released"], ["P"])
+        self.assertEqual(len(reopened.manual_intervention_history()), 1)
+        record = reopened.manual_intervention_history()[0]
+        self.assertEqual(record["target"], {"jid": a.jid, "task": "A"})
+        self.assertEqual(record["affected_jobs"], [a.jid, b.jid])
+        self.assertEqual(record["commitment_basis_preserved"], ["cD", "cX"])
+
+    def test_timeout_requires_confirmation_and_fires_once(self):
+        sys_ = manual_cycle_system()
+        sys_.run_until(6)
+        a = next(j for j in sys_.jobs if j.task.name == "A")
+        preview = sys_.prepare_resource_cycle_intervention(
+            a.jid, action="timeout", timeout=2,
+            intervention_id="wait-a")
+        self.assertEqual(preview["execute_at"], 8)
+        self.assertEqual(preview["status"], "applied")
+
+        # 未确认超时不会触发
+        sys_.run_until(9)
+        self.assertEqual(a.state, "blocked")
+        self.assertEqual(a.held, ["P"])
+        self.assertEqual(sys_.manual_intervention_history(), [])
+
+        # 保存重开后仍需确认；确认后下一边界触发
+        reopened = System.restore(sys_.snapshot())
+        reopened_a = next(j for j in reopened.jobs if j.task.name == "A")
+        self.assertEqual(
+            reopened.pending_resource_cycle_interventions()[0]["status"],
+            "unconfirmed",
+        )
+        armed = reopened.confirm_resource_cycle_intervention("wait-a")
+        self.assertEqual(armed["status"], "armed")
+        reopened.run_until(10)
+        self.assertEqual(reopened_a.state, "aborted")
+        self.assertEqual(reopened_a.held, [])
+
+        reopened.run_until(12)
+        self.assertEqual(len(reopened.manual_intervention_history()), 1)
+        self.assertEqual(reopened.pending_resource_cycle_interventions(), [])
+
     def test_real_resource_cycle_reported_separately(self):
         """真实资源环：保留持有关系、说明优先级无法解决、独立任务不受拖累。"""
         sys_ = System(

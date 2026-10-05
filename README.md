@@ -124,6 +124,27 @@ strategy=...)` 描述一项**临时关键程度承诺**：达到指定事件后�
   `unresolvable_waits`（无法仅靠优先级解除的等待环）、`errors`
   （错过截止与锁预算超期）。
 
+### 人工处置预演与确认
+
+对已经检测出的资源环，可对环上尚可撤销的作业预演人工处置：
+
+- `prepare_resource_cycle_intervention(jid, action="abort")`：预演立即
+  中止该作业，返回将释放的资源、保留的已完成/剩余工作、会被唤醒或仍因
+  其他临时承诺等待的作业。
+- `prepare_resource_cycle_intervention(jid, action="timeout", timeout=n)`：
+  预演“等待 n 拍后超时”；预演不改变调度，也不会在到时自动生效。
+- `confirm_resource_cycle_intervention(id)`：立即中止会马上生效；等待
+  超时则进入 armed 状态，保存重开后仍需此前明确确认，到时只触发一次。
+- `pending_resource_cycle_interventions()` 查看未确认/armed 预演；
+  `manual_intervention_history()` 查看实际影响到的作业和资源。
+
+确认前的预演只在快照副本上计算，不释放当前资源、不改时钟和 trace。
+重复确认同一处置不会二次释放；若等待已经自行解除，超时记录为 expired
+且不释放任何资源。中止会保留作业的 `pc/step_left`、已执行工作量与
+完成事实，同时按实际持有清单释放资源，并把该作业从其等待队列移除。
+同一等待者仍受其他临时承诺约束时，会逐项保留这些依据；撤回单条承诺
+只移除对应来源，不会误清其他来源。
+
 ## 为功耗模型预留的扩展点
 
 - `TaskSpec.attrs` 与 `Job.record` 是开放字典：将来挂功耗参数

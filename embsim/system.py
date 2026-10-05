@@ -44,7 +44,7 @@ class Job:
     mode: str = "default"
     pc: int = 0                      # 当前程序步下标
     step_left: int = 0               # 当前 run 步剩余拍数
-    state: str = "ready"             # ready/running/blocked/deferred/done
+    state: str = "ready"             # ready/running/blocked/deferred/done/aborted
     held: List[str] = field(default_factory=list)
     blocked_on: Optional[str] = None
     lock_request_mode: Optional[str] = None
@@ -154,6 +154,24 @@ class ConcessionEvent:
     resume_reason: Optional[str] = None
 
 
+@dataclass
+class ManualInterventionRecord:
+    """人工资源环处置的实际影响审计记录。"""
+
+    id: str
+    action: str
+    time: int
+    target_jid: int
+    target_task: str
+    released_resources: List[str]
+    resumed_waiters: List[Dict]
+    affected_jobs: List[int]
+    retained_work: Dict
+    basis_commitments: List[str]
+    status: str = "applied"
+    reason: Optional[str] = None
+
+
 class System:
     def __init__(
         self,
@@ -197,6 +215,9 @@ class System:
         self.commitment_events: List[CommitmentEvent] = []
         self.concession_events: List[ConcessionEvent] = []
         self._next_commitment_seq = 0
+        self.pending_manual_interventions: Dict[str, Dict] = {}
+        self.manual_intervention_records: List[ManualInterventionRecord] = []
+        self._next_intervention_seq = 0
 
         self.now = 0
         self.jobs: List[Job] = []
@@ -435,7 +456,7 @@ class System:
         )
         protected = self._protected_holders()
         for job in self.jobs:
-            if job.state in ("done", "blocked"):
+            if job.state in ("done", "aborted", "blocked"):
                 continue
             if job.jid in protected:
                 # 持锁链上的持有者豁免延后：必须先把临界区跑完放锁
@@ -763,6 +784,7 @@ class System:
         """推进一拍（切换决策本身不耗拍，切换开销在后续拍计入）。"""
         self._apply_due_mode_change()
         self._apply_due_commitment_events()
+        self._apply_due_manual_interventions()
         self._release_due()
 
         if self._irq_pending:
@@ -842,11 +864,12 @@ class System:
     def _finish_tick(self):
         self.now += 1
         self._apply_due_mode_change(self.now)
+        self._apply_due_manual_interventions()
         # 拍边界：预排到此刻的升级/撤回在同一边界生效，
         # 与模式切换的先后按各自请求顺序独立保留（互不改写历史）
         self._apply_due_commitment_events()
         for job in self.jobs:
-            if (not job.missed and job.state != "done"
+            if (not job.missed and job.state not in ("done", "aborted")
                     and self.now >= job.abs_deadline):
                 job.missed = True
                 self.misses.append(MissRecord(
@@ -907,6 +930,264 @@ class System:
                 "held_resources": list(job.held),
             })
         return result
+
+    # ------------------------------------------------------ 资源环人工处置
+
+    def prepare_resource_cycle_intervention(
+        self,
+        jid: int,
+        action: str = "abort",
+        timeout: Optional[int] = None,
+        intervention_id: Optional[str] = None,
+    ) -> Dict:
+        """为资源环生成未确认的人工处置预演；不改变当前调度。"""
+        if action not in ("abort", "timeout"):
+            raise ValueError("unknown manual intervention action: %r" % action)
+        target = self._find_job(jid)
+        if target.state in ("done", "aborted"):
+            raise ValueError("job #%d is no longer active" % jid)
+        if not self._job_in_cycle(jid):
+            raise ValueError("job #%d is not part of an unresolvable cycle" % jid)
+        execute_at = self.now if action == "abort" else self._timeout_time(timeout)
+        plan_id = intervention_id or (
+            "manual-%d" % self._next_intervention_seq)
+        if any(r.id == plan_id for r in self.manual_intervention_records):
+            raise ValueError("duplicate intervention id: %r" % plan_id)
+        if plan_id in self.pending_manual_interventions:
+            raise ValueError("duplicate intervention id: %r" % plan_id)
+        if intervention_id is None:
+            self._next_intervention_seq += 1
+
+        preview_clone = System.restore(self.snapshot())
+        preview = preview_clone._stage_intervention(
+            target=preview_clone._find_job(jid),
+            action=action,
+            execute_at=execute_at,
+            intervention_id=plan_id,
+            persist_record=False,
+        )
+        plan = {
+            "id": plan_id,
+            "action": action,
+            "jid": jid,
+            "task": target.task.name,
+            "created_at": self.now,
+            "execute_at": execute_at,
+            "confirmed": False,
+            "status": "unconfirmed",
+            "preview": preview,
+        }
+        self.pending_manual_interventions[plan_id] = plan
+        return preview
+
+    def confirm_resource_cycle_intervention(self, intervention_id: str) -> Dict:
+        """确认预演；重复确认不会重复释放资源。"""
+        plan = self.pending_manual_interventions.get(intervention_id)
+        if plan is None:
+            existing = next(
+                (r for r in self.manual_intervention_records
+                 if r.id == intervention_id),
+                None,
+            )
+            if existing is None:
+                raise KeyError("unknown manual intervention: %r" % intervention_id)
+            return self._record_to_dict(existing)
+
+        if plan["confirmed"]:
+            return self._record_to_dict(
+                next(r for r in self.manual_intervention_records
+                     if r.id == intervention_id)
+            ) if plan["status"] == "applied" else dict(plan["preview"])
+
+        plan["confirmed"] = True
+        if plan["action"] == "abort":
+            target = self._find_job(plan["jid"])
+            record = self._stage_intervention(
+                target=target,
+                action="abort",
+                execute_at=self.now,
+                intervention_id=intervention_id,
+                persist_record=True,
+            )
+            self.pending_manual_interventions.pop(intervention_id, None)
+            return record
+
+        plan["status"] = "armed"
+        plan["preview"]["status"] = "armed"
+        return dict(plan["preview"])
+
+    def pending_resource_cycle_interventions(self) -> List[Dict]:
+        """返回保存/当前仍需人工确认或等待触发的处置预演。"""
+        return [dict(plan["preview"], status=plan["status"],
+                     confirmed=plan["confirmed"])
+                for plan in self.pending_manual_interventions.values()]
+
+    def manual_intervention_history(self) -> List[Dict]:
+        """返回人工处置实际影响到的作业与资源。"""
+        return [self._record_to_dict(r)
+                for r in self.manual_intervention_records]
+
+    def _timeout_time(self, timeout: Optional[int]) -> int:
+        if timeout is None:
+            raise ValueError("timeout intervention requires a timeout")
+        if timeout < 0:
+            raise ValueError("timeout cannot be negative")
+        return self.now + timeout
+
+    def _job_in_cycle(self, jid: int) -> bool:
+        cycle_jids = {
+            member["jid"]
+            for cycle in self.wait_cycles()
+            for member in cycle["members"]
+        }
+        return jid in cycle_jids
+
+    def _find_job(self, jid: int) -> Job:
+        for job in self.jobs:
+            if job.jid == jid:
+                return job
+        raise KeyError("no job with jid=%r" % (jid,))
+
+    def _stage_intervention(
+        self,
+        target: Job,
+        action: str,
+        execute_at: int,
+        intervention_id: str,
+        persist_record: bool,
+    ) -> Dict:
+        released = list(target.held)
+        before_remaining = target.remaining_work()
+        retained = {
+            "jid": target.jid,
+            "task": target.task.name,
+            "executed_work": target.task.wcet - before_remaining,
+            "remaining_work": before_remaining,
+            "pc": target.pc,
+            "step_left": target.step_left,
+            "commitment_basis": list(target.deferred_by_sources),
+        }
+        woken = []
+        basis = set(target.deferred_by_sources)
+
+        should_apply = action == "abort" or (
+            action == "timeout" and target.state == "blocked"
+            and self._job_in_cycle(target.jid))
+        if should_apply:
+            if self.current is target:
+                self.current = None
+            if self._switch_to is target:
+                self._switch_to = None
+                self._switch_left = 0
+            for res_name in list(target.held):
+                res = self.resources[res_name]
+                if res["holder"] is target:
+                    self._finish_lock_budget(res, execute_at)
+                    waiters = list(res["waiters"])
+                    res["holder"] = None
+                    res["waiters"].clear()
+                    res["acquired_at"] = None
+                    res["mode"] = None
+                    res["budget"] = None
+                    for waiter in waiters:
+                        if waiter is target:
+                            continue
+                        waiter.blocked_on = None
+                        if waiter.state == "blocked":
+                            waiter.state = "ready"
+                        woken.append(waiter)
+            for res in self.resources.values():
+                if target in res["waiters"]:
+                    res["waiters"].remove(target)
+            target.held.clear()
+            target.blocked_on = None
+            target.boost = 0
+            target.state = "aborted"
+            self._recompute_boosts()
+            self._recompute_deferrals()
+
+        affected = sorted({target.jid, *(w.jid for w in woken)})
+        if should_apply:
+            basis.update(target.deferred_by_sources)
+            for waiter in woken:
+                basis.update(waiter.deferred_by_sources)
+        resume_info = []
+        for waiter in woken:
+            resume_info.append({
+                "jid": waiter.jid,
+                "task": waiter.task.name,
+                "state_after": waiter.state,
+                "can_continue": waiter.state in ("ready", "running"),
+                "commitment_basis": list(waiter.deferred_by_sources),
+            })
+        status = "applied" if should_apply else "expired"
+        reason = None if should_apply else "等待已结束，超时不再释放资源"
+        preview = {
+            "id": intervention_id,
+            "status": status,
+            "action": action,
+            "created_at": self.now if not persist_record else execute_at,
+            "execute_at": execute_at,
+            "target": {"jid": target.jid, "task": target.task.name},
+            "resources_released": released if should_apply else [],
+            "completed_work_preserved": retained,
+            "waiters_continue": resume_info,
+            "affected_jobs": affected if should_apply else [target.jid],
+            "commitment_basis_preserved": sorted(basis),
+            "reason": reason,
+            "confirmed": persist_record,
+        }
+        if persist_record:
+            self.manual_intervention_records.append(ManualInterventionRecord(
+                id=intervention_id,
+                action=action,
+                time=execute_at,
+                target_jid=target.jid,
+                target_task=target.task.name,
+                released_resources=list(released) if should_apply else [],
+                resumed_waiters=resume_info,
+                affected_jobs=affected if should_apply else [target.jid],
+                retained_work=retained,
+                basis_commitments=sorted(basis),
+                status=status,
+                reason=reason,
+            ))
+        return preview
+
+    def _apply_due_manual_interventions(self):
+        for plan in list(self.pending_manual_interventions.values()):
+            if plan["action"] != "timeout" or not plan["confirmed"]:
+                continue
+            if self.now < plan["execute_at"]:
+                continue
+            target = self._find_job(plan["jid"])
+            preview = self._stage_intervention(
+                target=target,
+                action="timeout",
+                execute_at=self.now,
+                intervention_id=plan["id"],
+                persist_record=True,
+            )
+            plan["status"] = preview["status"]
+            plan["preview"] = preview
+            self.pending_manual_interventions.pop(plan["id"], None)
+
+    def _record_to_dict(self, record: ManualInterventionRecord) -> Dict:
+        return {
+            "id": record.id,
+            "status": record.status,
+            "action": record.action,
+            "execute_at": record.time,
+            "target": {"jid": record.target_jid,
+                       "task": record.target_task},
+            "resources_released": list(record.released_resources),
+            "completed_work_preserved": dict(record.retained_work),
+            "waiters_continue": [dict(w) for w in record.resumed_waiters],
+            "affected_jobs": list(record.affected_jobs),
+            "commitment_basis_preserved": list(record.basis_commitments),
+            "reason": record.reason,
+            "confirmed": True,
+        }
 
     # ------------------------------------------------------------ 等待环与汇报
 
@@ -1007,6 +1288,7 @@ class System:
                     for v in self.lock_budget_violations
                 ],
             },
+            "manual_interventions": self.manual_intervention_history(),
         }
 
     def compare_concessions(
