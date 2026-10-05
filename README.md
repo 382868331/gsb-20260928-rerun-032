@@ -138,6 +138,14 @@ strategy=...)` 描述一项**临时关键程度承诺**：达到指定事件后�
   幂等——返回同一份 `InterventionRecord`，不会重复释放资源。
   记录含实际影响的作业、释放的资源、被唤醒的等待者与生效时刻，
   可在 `run_report()["interventions"]` 与 `["aborted"]` 中追溯。
+- **确认前核对时效**：预演登记时冻结所依据的现场（各作业状态、
+  资源持有/等待关系、生效与待生效的临时承诺）。`confirm_intervention`
+  先逐项核对，若等待确认期间现场已变（等待者退出、新增承诺、相关
+  工作完成等），则把预演标记为 `stale`、逐条列出中文差异并抛出
+  `StaleRehearsalError` 要求重新预演——绝不照旧推演结果中止已经
+  恢复的任务或释放资源。旧预演的 `preview` 与 `stale_diff` 保留在
+  `intervention_rehearsals` 中，原来的预测与确认后的实际处置
+  （`intervention_records`）都可追溯。
 - 被中止作业已执行的 run 拍与已付开销留在时间线上（trace 不改写）；
   仍被承诺延后的等待者保持延后，不参与本次抢锁。
 - 未确认的预演随快照一并序列化，`pending_interventions()` 在保存

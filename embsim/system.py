@@ -173,6 +173,25 @@ class InterventionRehearsal:
     timeout: Optional[int]
     preview: Dict
     status: str = "pending"
+    # 预演所依据的现场（任务状态、资源占用、临时承诺），确认前核对；
+    # 不一致时预演标记为 stale，stale_diff 记录具体差异供追溯。
+    basis: Optional[Dict] = None
+    stale_diff: Optional[List[str]] = None
+
+
+class StaleRehearsalError(RuntimeError):
+    """确认时预演依据已过时：展示差异并要求重新预演。
+
+    diffs 为逐条中文差异说明；携带该异常的预演不会被确认，
+    更不会按旧推演结果中止已经恢复的任务或释放资源。
+    """
+
+    def __init__(self, rid: int, diffs: List[str]):
+        self.rid = rid
+        self.diffs = list(diffs)
+        super().__init__(
+            "预演 #%d 的依据已变化，需重新预演：\n" % rid
+            + "\n".join("- " + d for d in self.diffs))
 
 
 @dataclass
@@ -1132,13 +1151,72 @@ class System:
             created_at=self.now,
             timeout=timeout if action == "timeout" else None,
             preview=preview,
+            basis=self._intervention_basis(),
         )
         self._next_rehearsal_id += 1
         self.intervention_rehearsals.append(rehearsal)
         return rehearsal
 
+    def _intervention_basis(self) -> Dict:
+        """预演所依据的现场：任务状态、资源占用与临时承诺。"""
+        return {
+            "jobs": {
+                j.jid: (j.task.name, j.state, tuple(j.held), j.blocked_on)
+                for j in self.jobs
+            },
+            "commitments": sorted(self.active_commitments),
+            "pending_commitments": sorted(
+                (e.name, e.kind, e.time)
+                for e in self.pending_commitment_events
+            ),
+        }
+
+    @staticmethod
+    def _basis_diff(old: Dict, new: Dict) -> List[str]:
+        """逐条列出两份现场之间的差异（中文说明）。"""
+        diffs = []
+        old_jobs, new_jobs = old["jobs"], new["jobs"]
+        for jid in sorted(set(old_jobs) | set(new_jobs)):
+            if jid not in old_jobs:
+                name, state = new_jobs[jid][0], new_jobs[jid][1]
+                diffs.append("作业 %s#%d 新释放（状态 %s）"
+                             % (name, jid, state))
+                continue
+            name, o_state, o_held, o_wait = old_jobs[jid]
+            _, n_state, n_held, n_wait = new_jobs[jid]
+            if o_state != n_state:
+                diffs.append("作业 %s#%d 状态 %s→%s"
+                             % (name, jid, o_state, n_state))
+            if o_held != n_held:
+                diffs.append("作业 %s#%d 持有资源 %s→%s"
+                             % (name, jid, list(o_held), list(n_held)))
+            if o_wait != n_wait:
+                diffs.append("作业 %s#%d 等待资源 %s→%s"
+                             % (name, jid, o_wait, n_wait))
+        for name in sorted(set(new["commitments"])
+                           - set(old["commitments"])):
+            diffs.append("新增生效承诺 %r" % name)
+        for name in sorted(set(old["commitments"])
+                           - set(new["commitments"])):
+            diffs.append("承诺 %r 已撤回" % name)
+        for name, kind, t in (set(map(tuple, new["pending_commitments"]))
+                              - set(map(tuple, old["pending_commitments"]))):
+            diffs.append("新增待生效承诺事件 %r（%s，第 %d 拍）"
+                         % (name, kind, t))
+        for name, kind, t in (set(map(tuple, old["pending_commitments"]))
+                              - set(map(tuple, new["pending_commitments"]))):
+            diffs.append("待生效承诺事件 %r（%s，第 %d 拍）已消失"
+                         % (name, kind, t))
+        return diffs
+
     def confirm_intervention(self, rid: int) -> InterventionRecord:
-        """确认一次预演并执行处置；重复确认返回同一记录，不重复释放。"""
+        """确认一次预演并执行处置；重复确认返回同一记录，不重复释放。
+
+        确认前核对预演所依据的任务、资源占用与临时承诺是否仍然相同；
+        若已变化（如有等待者退出、新增承诺或相关工作完成），则把预演
+        标记为 stale、记录具体差异并抛出 StaleRehearsalError 要求重新
+        预演——绝不照旧推演结果中止已经恢复的任务或释放资源。
+        """
         rehearsal = next(
             (r for r in self.intervention_rehearsals if r.rid == rid), None)
         if rehearsal is None:
@@ -1147,6 +1225,13 @@ class System:
             (r for r in self.intervention_records if r.rid == rid), None)
         if existing is not None:
             return existing  # 幂等：确认与重复确认不重复释放资源
+        if rehearsal.status == "stale":
+            raise StaleRehearsalError(rid, rehearsal.stale_diff or [])
+        diffs = self._basis_diff(rehearsal.basis, self._intervention_basis())
+        if diffs:
+            rehearsal.status = "stale"
+            rehearsal.stale_diff = diffs
+            raise StaleRehearsalError(rid, diffs)
         job = self._find_job(rehearsal.jid)
         if rehearsal.action == "abort":
             record = self._apply_abort(rehearsal, job, self.now)
