@@ -173,6 +173,23 @@ class InterventionRehearsal:
     timeout: Optional[int]
     preview: Dict
     status: str = "pending"
+    # 预演时刻的环境基线：任务状态、资源占用与临时承诺；
+    # 确认前据此核对预演是否已过时。
+    basis: Optional[Dict] = None
+    # 确认时发现的具体差异（status 变为 "stale" 时填写），
+    # 与原始 preview 一起保留供事后追溯。
+    stale_diffs: Optional[List[str]] = None
+
+
+class StaleRehearsalError(RuntimeError):
+    """确认时预演所依据的环境已变化：拒绝照旧执行，要求重新预演。"""
+
+    def __init__(self, rid: int, diffs: List[str]):
+        self.rid = rid
+        self.diffs = list(diffs)
+        super().__init__(
+            "预演 #%d 已过时，需重新预演后才能确认：\n%s"
+            % (rid, "\n".join("- " + d for d in diffs)))
 
 
 @dataclass
@@ -1132,13 +1149,99 @@ class System:
             created_at=self.now,
             timeout=timeout if action == "timeout" else None,
             preview=preview,
+            basis=self._intervention_basis(job),
         )
         self._next_rehearsal_id += 1
         self.intervention_rehearsals.append(rehearsal)
         return rehearsal
 
+    def _intervention_basis(self, job: Job) -> Dict:
+        """预演时刻的环境快照：任务、资源占用与临时承诺。
+
+        确认前用同一口径重新采集并逐项比对；任何一项变化都说明
+        预演推演的前提已不成立，必须重新预演。
+        """
+        return {
+            "job": {
+                "state": job.state,
+                "held": sorted(job.held),
+                "blocked_on": job.blocked_on,
+                "remaining": job.remaining_work(),
+            },
+            "resources": {
+                name: {
+                    "holder": (res["holder"].jid
+                               if res["holder"] is not None else None),
+                    "waiters": sorted(w.jid for w in res["waiters"]),
+                }
+                for name, res in sorted(self.resources.items())
+            },
+            "commitments": {
+                "active": sorted(self.active_commitments),
+                "pending": sorted(
+                    (e.time, e.kind, e.name)
+                    for e in self.pending_commitment_events
+                ),
+            },
+            "deferred": {
+                j.jid: sorted(j.deferred_by_sources)
+                for j in self.jobs if j.deferred_by_sources
+            },
+        }
+
+    def _rehearsal_diffs(self, rehearsal: InterventionRehearsal) -> List[str]:
+        """比对预演基线与当前环境，返回具体差异（空列表表示仍有效）。"""
+        if rehearsal.basis is None:
+            return []
+        job = self._find_job(rehearsal.jid)
+        now = self._intervention_basis(job)
+        old = rehearsal.basis
+        diffs = []
+        label = "%s#%d" % (rehearsal.task, rehearsal.jid)
+        for key, text in (
+            ("state", "状态"), ("blocked_on", "等待的资源"),
+            ("remaining", "剩余工作量"),
+        ):
+            if old["job"][key] != now["job"][key]:
+                diffs.append("作业 %s 的%s由 %r 变为 %r"
+                             % (label, text, old["job"][key],
+                                now["job"][key]))
+        if old["job"]["held"] != now["job"]["held"]:
+            diffs.append("作业 %s 持有的资源由 %s 变为 %s"
+                         % (label, old["job"]["held"], now["job"]["held"]))
+        for name in sorted(set(old["resources"]) | set(now["resources"])):
+            before = old["resources"].get(name)
+            after = now["resources"].get(name)
+            if before == after:
+                continue
+            before = before or {"holder": None, "waiters": []}
+            after = after or {"holder": None, "waiters": []}
+            if before["holder"] != after["holder"]:
+                diffs.append("资源 %s 的持有者由 %s 变为 %s"
+                             % (name, before["holder"], after["holder"]))
+            if before["waiters"] != after["waiters"]:
+                diffs.append("资源 %s 的等待者由 %s 变为 %s"
+                             % (name, before["waiters"], after["waiters"]))
+        for key, text in (("active", "生效中的临时承诺"),
+                          ("pending", "待生效的承诺事件")):
+            if old["commitments"][key] != now["commitments"][key]:
+                diffs.append("%s由 %s 变为 %s"
+                             % (text, old["commitments"][key],
+                                now["commitments"][key]))
+        if old["deferred"] != now["deferred"]:
+            diffs.append("被让步延后的作业由 %s 变为 %s"
+                         % (old["deferred"], now["deferred"]))
+        return diffs
+
     def confirm_intervention(self, rid: int) -> InterventionRecord:
-        """确认一次预演并执行处置；重复确认返回同一记录，不重复释放。"""
+        """确认一次预演并执行处置；重复确认返回同一记录，不重复释放。
+
+        确认前先核对预演所依据的任务状态、资源占用与临时承诺是否
+        仍然相同；若已变化（例如等待者退出、新增承诺、相关工作
+        已完成），则把预演标记为 stale、展示具体差异并抛出
+        StaleRehearsalError 要求重新预演——绝不照旧结果中止
+        已经恢复的任务，也不产生任何资源释放。
+        """
         rehearsal = next(
             (r for r in self.intervention_rehearsals if r.rid == rid), None)
         if rehearsal is None:
@@ -1147,6 +1250,11 @@ class System:
             (r for r in self.intervention_records if r.rid == rid), None)
         if existing is not None:
             return existing  # 幂等：确认与重复确认不重复释放资源
+        diffs = self._rehearsal_diffs(rehearsal)
+        if diffs:
+            rehearsal.status = "stale"
+            rehearsal.stale_diffs = diffs
+            raise StaleRehearsalError(rid, diffs)
         job = self._find_job(rehearsal.jid)
         if rehearsal.action == "abort":
             record = self._apply_abort(rehearsal, job, self.now)
@@ -1300,6 +1408,14 @@ class System:
                 for j in self.jobs if j.state == "aborted"
             ],
             "unresolvable_waits": self.wait_cycles(),
+            "stale_rehearsals": [
+                {"rid": r.rid, "action": r.action, "jid": r.jid,
+                 "task": r.task, "created_at": r.created_at,
+                 "preview": r.preview,
+                 "stale_diffs": list(r.stale_diffs or [])}
+                for r in self.intervention_rehearsals
+                if r.status == "stale"
+            ],
             "interventions": [
                 {"rid": r.rid, "action": r.action, "jid": r.jid,
                  "task": r.task, "confirmed_at": r.confirmed_at,

@@ -23,6 +23,7 @@ from .system import (
     Job,
     MissRecord,
     Segment,
+    StaleRehearsalError,
     System,
 )
 from .explain import MissExplanation, explain_miss
@@ -42,6 +43,7 @@ __all__ = [
     "ConcessionEvent",
     "InterventionRehearsal",
     "InterventionRecord",
+    "StaleRehearsalError",
     "MissRecord",
     "Segment",
     "System",

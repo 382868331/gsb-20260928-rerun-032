@@ -16,6 +16,7 @@ from embsim import (
     Costs,
     InterruptSource,
     ModeSpec,
+    StaleRehearsalError,
     System,
     TaskSpec,
     explain_miss,
@@ -1183,6 +1184,101 @@ class InterventionRehearsalTest(unittest.TestCase):
         self.assertEqual(d.state, "done")
         with self.assertRaises(ValueError):
             sys_.rehearse_intervention("abort", d.jid)
+
+
+class StaleRehearsalTest(unittest.TestCase):
+    """预演在等待确认期间过时：确认前核对基线，拒绝照旧执行。"""
+
+    def test_waiter_exits_before_confirm(self):
+        """预演后一名等待者退出：确认被拒绝，不产生额外资源释放。"""
+        sys_ = _cycle_system()
+        jobs = {j.task.name: j for j in sys_.jobs}
+        a, b = jobs["A"], jobs["B"]
+        rehearsal = sys_.rehearse_intervention("abort", a.jid)
+        # 另一名等待者 B 经独立的超时处置退出等待环
+        other = sys_.rehearse_intervention("timeout", b.jid, timeout=1)
+        sys_.confirm_intervention(other.rid)
+        sys_.run_until(13)
+        self.assertEqual(b.state, "aborted")
+        # 保存重开后确认旧预演：已过时，拒绝执行
+        clone = System.restore(sys_.snapshot())
+        ca = next(j for j in clone.jobs if j.task.name == "A")
+        with self.assertRaises(StaleRehearsalError) as ctx:
+            clone.confirm_intervention(rehearsal.rid)
+        self.assertEqual(ctx.exception.rid, rehearsal.rid)
+        self.assertTrue(ctx.exception.diffs)
+        # 不照旧中止已恢复的 A，也不释放 P
+        self.assertNotEqual(ca.state, "aborted")
+        self.assertEqual(ca.held, ["P"])
+        self.assertIs(clone.resources["P"]["holder"], ca)
+        self.assertEqual(clone.intervention_records
+                         and len(clone.intervention_records), 1)  # 仅 B 的超时
+        # 历史可追溯：原始预测与差异都保留
+        stale = next(r for r in clone.intervention_rehearsals
+                     if r.rid == rehearsal.rid)
+        self.assertEqual(stale.status, "stale")
+        self.assertEqual(stale.preview["resources_released"], ["P"])
+        report = clone.run_report()
+        self.assertEqual([s["rid"] for s in report["stale_rehearsals"]],
+                         [rehearsal.rid])
+        self.assertEqual(report["stale_rehearsals"][0]["preview"]
+                         ["work_preserved_ticks"], 1)
+        self.assertTrue(report["stale_rehearsals"][0]["stale_diffs"])
+
+    def test_new_commitment_before_confirm(self):
+        """预演后新增一条临时承诺：确认被拒绝并指出承诺差异。"""
+        sys_ = _cycle_system()
+        a = next(j for j in sys_.jobs if j.task.name == "A")
+        rehearsal = sys_.rehearse_intervention("abort", a.jid)
+        sys_.escalate(CriticalityCommitment(
+            "boost-b", task="B", priority=9, strategy="defer"))
+        sys_.run_until(13)
+        self.assertIn("boost-b", sys_.active_commitments)
+        clone = System.restore(sys_.snapshot())
+        with self.assertRaises(StaleRehearsalError) as ctx:
+            clone.confirm_intervention(rehearsal.rid)
+        self.assertTrue(any("承诺" in d for d in ctx.exception.diffs))
+        ca = next(j for j in clone.jobs if j.task.name == "A")
+        self.assertEqual(ca.state, "blocked")
+        self.assertEqual(ca.held, ["P"])
+        self.assertEqual(clone.intervention_records, [])
+
+    def test_related_work_completes_before_confirm(self):
+        """预演后相关工作完成、被阻塞者恢复：保存重开后确认仍被拒绝。"""
+        sys_ = System(
+            tasks=[
+                TaskSpec("A", 3,
+                         [lock("P"), run(1), lock("Q"), run(1),
+                          unlock("Q"), unlock("P")],
+                         period=100, offset=2),
+                TaskSpec("C", 2, [lock("Q"), run(5), unlock("Q")],
+                         period=100),
+            ],
+            costs=Costs(context_switch=0, lock=1, unlock=1),
+        )
+        sys_.run_until(5)
+        a = next(j for j in sys_.jobs if j.task.name == "A")
+        self.assertEqual(a.state, "blocked")
+        self.assertEqual(a.held, ["P"])
+        rehearsal = sys_.rehearse_intervention("abort", a.jid)
+        # C 完成并放出 Q，A 恢复继续；随后保存重开
+        sys_.run_until(11)
+        c = next(j for j in sys_.jobs if j.task.name == "C")
+        self.assertEqual(c.state, "done")
+        self.assertNotEqual(a.state, "blocked")
+        clone = System.restore(sys_.snapshot())
+        with self.assertRaises(StaleRehearsalError):
+            clone.confirm_intervention(rehearsal.rid)
+        ca = next(j for j in clone.jobs if j.task.name == "A")
+        # 已恢复的 A 不被旧预演中止，P 不被额外释放
+        self.assertNotEqual(ca.state, "aborted")
+        self.assertEqual(ca.held, ["P", "Q"])
+        self.assertEqual(clone.intervention_records, [])
+        # 重新预演后可以正常确认
+        fresh = clone.rehearse_intervention("abort", ca.jid)
+        record = clone.confirm_intervention(fresh.rid)
+        self.assertEqual(sorted(record.resources_released), ["P", "Q"])
+        self.assertEqual(ca.state, "aborted")
 
 
 if __name__ == "__main__":
